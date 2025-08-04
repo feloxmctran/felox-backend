@@ -9,10 +9,14 @@ app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 // Veritabanı bağlantısı ve tablolar
+const path = require('path');
+console.log("Kullanılan veritabanı yolu:", path.resolve("./felox.db"));
+
 const db = new sqlite3.Database("./felox.db", (err) => {
   if (err) return console.error("DB bağlantı hatası:", err.message);
   console.log("SQLite DB bağlantısı başarılı");
 });
+
 
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
