@@ -2,21 +2,19 @@ const express = require("express");
 const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const bodyParser = require("body-parser");
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Veritabanı bağlantısı ve tablolar
-const path = require('path');
 console.log("Kullanılan veritabanı yolu:", path.resolve("./felox.db"));
 
 const db = new sqlite3.Database("./felox.db", (err) => {
   if (err) return console.error("DB bağlantı hatası:", err.message);
   console.log("SQLite DB bağlantısı başarılı");
 });
-
 
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -47,8 +45,6 @@ db.serialize(() => {
     correct_answer TEXT,
     point INTEGER DEFAULT 1
   )`);
-  // answers tablosunda created_at yoksa bir kere aşağıdakini elle terminalde çalıştır: 
-  // db.run("ALTER TABLE answers ADD COLUMN created_at TEXT");
   db.run(`CREATE TABLE IF NOT EXISTS answers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -81,6 +77,7 @@ function getDateRange(type) {
   return { start, end };
 }
 
+// ---- KAYIT (register): Kullanıcıyı hemen döndür! ----
 // Kayıt
 app.post("/api/register", (req, res) => {
   const { ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role } = req.body;
@@ -95,10 +92,21 @@ app.post("/api/register", (req, res) => {
         }
         return res.status(500).json({ error: "Kayıt başarısız." });
       }
-      res.json({ success: true });
+      // Yeni kullanıcıyı dön!
+      db.get(
+        `SELECT id, ad, soyad, email, role FROM users WHERE id = ?`,
+        [this.lastID],
+        (err2, user) => {
+          if (err2 || !user) {
+            return res.json({ success: true });
+          }
+          res.json({ success: true, user });
+        }
+      );
     }
   );
 });
+
 
 // Giriş
 app.post("/api/login", (req, res) => {
