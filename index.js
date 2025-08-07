@@ -502,15 +502,19 @@ app.get("/api/user/approved-surveys", (req, res) => {
       if (surveys.length === 0) return res.json({ success: true, surveys: [] });
 
       let done = 0;
+      let filteredSurveys = [];
       surveys.forEach((survey, idx) => {
         db.get(
           `SELECT COUNT(*) as question_count FROM questions WHERE survey_id = ?`,
           [survey.id],
           (err2, row) => {
             survey.question_count = row ? row.question_count : 0;
+            if (survey.question_count > 0) {
+              filteredSurveys.push(survey);
+            }
             done++;
             if (done === surveys.length) {
-              res.json({ success: true, surveys });
+              res.json({ success: true, surveys: filteredSurveys });
             }
           }
         );
@@ -518,6 +522,7 @@ app.get("/api/user/approved-surveys", (req, res) => {
     }
   );
 });
+
 
 // Belirli bir anket (survey) için leaderboard
 app.get("/api/surveys/:surveyId/leaderboard", (req, res) => {
