@@ -1,0 +1,6 @@
+id,editor_id,title,start_date,end_date,category,status
+1,1,Genel Kültür,2025-07-19,2025-07-26,genel,approved
+2,1,Tarih ve Coğrafya,2025-07-20,2025-07-27,Tarih,approved
+3,1,Teknoloji,2025-07-21,2025-07-23,teknoloji,approved
+4,1,Spor,2025-07-21,2025-07-22,Spor,approved
+5,1,Türkçe Müzik,2025-08-01,2026-08-01,Türkçe Müzik,approved

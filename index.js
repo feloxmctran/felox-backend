@@ -511,6 +511,38 @@ app.get("/api/user/approved-surveys", (req, res) => {
   );
 });
 
+// Belirli bir anket (survey) için leaderboard
+app.get("/api/surveys/:surveyId/leaderboard", (req, res) => {
+  const surveyId = req.params.surveyId;
+  db.all(
+    `
+    SELECT u.id, u.ad, u.soyad,
+      COALESCE(SUM(
+        CASE
+          WHEN a.answer = 'bilmem' THEN 0
+          WHEN a.is_correct = 1 THEN q.point
+          WHEN a.is_correct = 0 THEN -q.point
+          ELSE 0
+        END
+      ), 0) AS total_points
+    FROM users u
+    LEFT JOIN answers a ON a.user_id = u.id
+      AND a.question_id IN (SELECT id FROM questions WHERE survey_id = ?)
+    LEFT JOIN questions q ON a.question_id = q.id
+      AND q.survey_id = ?
+    GROUP BY u.id
+    ORDER BY total_points DESC, u.id ASC
+    LIMIT 100
+    `,
+    [surveyId, surveyId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: "Anket leaderboard alınamadı!" });
+      res.json({ success: true, leaderboard: rows });
+    }
+  );
+});
+
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Backend http://localhost:${PORT} üzerinde çalışıyor`);
