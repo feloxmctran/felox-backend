@@ -107,6 +107,14 @@ app.post("/api/register", (req, res) => {
   );
 });
 
+// Kullanıcı gerçekten var mı kontrolü (login-page için)
+app.get("/api/user/:userId/exists", (req, res) => {
+  db.get(`SELECT id FROM users WHERE id = ?`, [req.params.userId], (err, user) => {
+    if (user) return res.json({ exists: true });
+    res.json({ exists: false });
+  });
+});
+
 
 // Giriş
 app.post("/api/login", (req, res) => {
@@ -541,6 +549,8 @@ app.get("/api/surveys/:surveyId/leaderboard", (req, res) => {
     }
   );
 });
+
+
 
 
 const PORT = process.env.PORT || 5000;
