@@ -16,6 +16,17 @@ const db = new sqlite3.Database("./felox.db", (err) => {
   console.log("SQLite DB bağlantısı başarılı");
 });
 
+// Güncel veritabanı dosyasını indir
+app.get("/backup", (req, res) => {
+  const dbPath = path.resolve("./felox.db");
+  res.download(dbPath, "felox-backup.db", (err) => {
+    if (err) {
+      console.error("Yedekleme sırasında hata:", err);
+      res.status(500).send("Yedekleme hatası");
+    }
+  });
+});
+
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
