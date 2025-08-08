@@ -2,12 +2,12 @@ const express = require("express");
 const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const bodyParser = require("body-parser");
-const path = require('path');
+const path = require("path");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json({ limit: "5mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "5mb" }));
 
 console.log("Kullanılan veritabanı yolu:", path.resolve("./felox.db"));
 
@@ -77,13 +77,24 @@ function getDateRange(type) {
   return { start, end };
 }
 
+// Yardımcı: Cevabı normalize et (evet/hayır/bilmem)
+function normalizeAnswer(v) {
+  if (v == null) return "";
+  let s = String(v).trim().toLowerCase();
+  if (s === "hayir") s = "hayır";
+  if (["evet", "hayır", "bilmem"].includes(s)) return s;
+  if (["yes", "true", "1"].includes(s)) return "evet";
+  if (["no", "false", "0"].includes(s)) return "hayır";
+  if (["dontknow", "unknown", "idk", "skip", "empty", "null"].includes(s)) return "bilmem";
+  return s;
+}
+
 // ---- KAYIT (register): Kullanıcıyı hemen döndür! ----
-// Kayıt
 app.post("/api/register", (req, res) => {
   const { ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role } = req.body;
   db.run(
     `INSERT INTO users (ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role],
     function (err) {
       if (err) {
@@ -92,7 +103,6 @@ app.post("/api/register", (req, res) => {
         }
         return res.status(500).json({ error: "Kayıt başarısız." });
       }
-      // Yeni kullanıcıyı dön!
       db.get(
         `SELECT id, ad, soyad, email, role FROM users WHERE id = ?`,
         [this.lastID],
@@ -107,14 +117,13 @@ app.post("/api/register", (req, res) => {
   );
 });
 
-// Kullanıcı gerçekten var mı kontrolü (login-page için)
+// Kullanıcı gerçekten var mı kontrolü
 app.get("/api/user/:userId/exists", (req, res) => {
   db.get(`SELECT id FROM users WHERE id = ?`, [req.params.userId], (err, user) => {
     if (user) return res.json({ exists: true });
     res.json({ exists: false });
   });
 });
-
 
 // Giriş
 app.post("/api/login", (req, res) => {
@@ -140,29 +149,38 @@ app.post("/api/login", (req, res) => {
 });
 
 // --------------- EDITOR ENDPOINTLERİ ---------------
+
+// Tek seferde anket + sorular
 app.post("/api/surveys", (req, res) => {
   const { editor_id, title, start_date, end_date, category, questions } = req.body;
   db.run(
     `INSERT INTO surveys (editor_id, title, start_date, end_date, category, status)
-    VALUES (?, ?, ?, ?, ?, 'pending')`,
+     VALUES (?, ?, ?, ?, ?, 'pending')`,
     [editor_id, title, start_date, end_date, category],
     function (err) {
       if (err) return res.status(500).json({ error: "Anket kaydedilemedi!" });
       const surveyId = this.lastID;
+
+      if (!Array.isArray(questions) || questions.length === 0) {
+        return res.json({ success: true, survey_id: surveyId });
+      }
+
       const stmt = db.prepare(
         `INSERT INTO questions (survey_id, question, correct_answer, point) VALUES (?, ?, ?, ?)`
       );
       questions.forEach((q) => {
         let p = 1;
         if (typeof q.point === "number" && q.point >= 1 && q.point <= 10) p = q.point;
-        stmt.run([surveyId, q.question, q.correct_answer, p]);
+        const ca = normalizeAnswer(q.correct_answer);
+        stmt.run([surveyId, q.question, ca, p]);
       });
       stmt.finalize();
-      res.json({ success: true });
+      res.json({ success: true, survey_id: surveyId });
     }
   );
 });
 
+// Editörün anketleri
 app.get("/api/editor/:editorId/surveys", (req, res) => {
   const editorId = req.params.editorId;
   db.all(
@@ -175,17 +193,23 @@ app.get("/api/editor/:editorId/surveys", (req, res) => {
   );
 });
 
+// Anket detay + sorular
 app.get("/api/surveys/:surveyId/details", (req, res) => {
   const surveyId = req.params.surveyId;
   db.get(`SELECT * FROM surveys WHERE id = ?`, [surveyId], (err, survey) => {
     if (err || !survey) return res.status(404).json({ error: "Anket bulunamadı" });
-    db.all(`SELECT * FROM questions WHERE survey_id = ?`, [surveyId], (err2, questions) => {
-      if (err2) return res.status(500).json({ error: "Sorular bulunamadı!" });
-      res.json({ success: true, survey, questions });
-    });
+    db.all(
+      `SELECT * FROM questions WHERE survey_id = ? ORDER BY id ASC`,
+      [surveyId],
+      (err2, questions) => {
+        if (err2) return res.status(500).json({ error: "Sorular bulunamadı!" });
+        res.json({ success: true, survey, questions });
+      }
+    );
   });
 });
 
+// Anket soft delete
 app.post("/api/surveys/:surveyId/delete", (req, res) => {
   const surveyId = req.params.surveyId;
   db.run(
@@ -198,7 +222,7 @@ app.post("/api/surveys/:surveyId/delete", (req, res) => {
   );
 });
 
-// --------------- ADMIN ENDPOINTLERİ ---------------
+// Admin listesi
 app.get("/api/admin/surveys", (req, res) => {
   db.all(
     `SELECT surveys.*, users.ad as editor_ad, users.soyad as editor_soyad
@@ -214,6 +238,7 @@ app.get("/api/admin/surveys", (req, res) => {
   );
 });
 
+// Anket onay/red
 app.post("/api/surveys/:surveyId/status", (req, res) => {
   const surveyId = req.params.surveyId;
   const { status } = req.body;
@@ -229,6 +254,7 @@ app.post("/api/surveys/:surveyId/status", (req, res) => {
   );
 });
 
+// Tek soru sil
 app.post("/api/questions/:questionId/delete", (req, res) => {
   const questionId = req.params.questionId;
   db.run(
@@ -241,13 +267,62 @@ app.post("/api/questions/:questionId/delete", (req, res) => {
   );
 });
 
+// ✅ TOPLU SORU EKLEME (Excel/bulk)
+app.post("/api/surveys/:surveyId/questions/bulk", (req, res) => {
+  const surveyId = req.params.surveyId;
+  const { questions } = req.body;
+
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return res.status(400).json({ error: "questions boş olamaz." });
+  }
+
+  db.get(`SELECT id FROM surveys WHERE id = ? AND status != 'deleted'`, [surveyId], (err, sv) => {
+    if (err || !sv) return res.status(404).json({ error: "Anket bulunamadı." });
+
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION");
+      const stmt = db.prepare(
+        `INSERT INTO questions (survey_id, question, correct_answer, point) VALUES (?, ?, ?, ?)`
+      );
+
+      try {
+        for (const q of questions) {
+          const text = (q.question || "").toString().trim();
+          let point = Number(q.point) || 1;
+          point = Math.min(10, Math.max(1, point));
+          const ca = normalizeAnswer(q.correct_answer);
+
+          if (!text) throw new Error("Boş question var");
+          if (!["evet", "hayır", "bilmem"].includes(ca)) {
+            throw new Error('correct_answer evet/hayır/bilmem olmalı');
+          }
+
+          stmt.run([surveyId, text, ca, point]);
+        }
+        stmt.finalize();
+        db.run("COMMIT", (err2) => {
+          if (err2) {
+            db.run("ROLLBACK");
+            return res.status(500).json({ error: "Toplu ekleme commit edilemedi." });
+          }
+          res.json({ success: true });
+        });
+      } catch (e) {
+        stmt.finalize();
+        db.run("ROLLBACK");
+        return res.status(400).json({ error: "Toplu ekleme hatası: " + e.message });
+      }
+    });
+  });
+});
+
 // --------------- USER ENDPOINTLERİ ---------------
 
-// Bir anketin sorularını getir (puanlı!)
+// Bir anketin soruları
 app.get("/api/surveys/:surveyId/questions", (req, res) => {
   const surveyId = req.params.surveyId;
   db.all(
-    `SELECT * FROM questions WHERE survey_id = ?`,
+    `SELECT * FROM questions WHERE survey_id = ? ORDER BY id ASC`,
     [surveyId],
     (err, rows) => {
       if (err) return res.status(500).json({ error: "Soru listesi hatası!" });
@@ -256,15 +331,16 @@ app.get("/api/surveys/:surveyId/questions", (req, res) => {
   );
 });
 
-// Kullanıcı cevaplarını kaydet (created_at!)
+// Kullanıcı cevap kaydet
 app.post("/api/answers", (req, res) => {
   const { user_id, question_id, answer } = req.body;
   db.get(`SELECT correct_answer FROM questions WHERE id = ?`, [question_id], (err, q) => {
     if (err || !q) return res.status(400).json({ error: "Soru bulunamadı!" });
-    const is_correct = q.correct_answer === answer ? 1 : 0;
+    const is_correct = q.correct_answer === normalizeAnswer(answer) ? 1 : 0;
     db.run(
-      `INSERT INTO answers (user_id, question_id, answer, is_correct, created_at) VALUES (?, ?, ?, ?, datetime('now', 'localtime'))`,
-      [user_id, question_id, answer, is_correct],
+      `INSERT INTO answers (user_id, question_id, answer, is_correct, created_at)
+       VALUES (?, ?, ?, ?, datetime('now', 'localtime'))`,
+      [user_id, question_id, normalizeAnswer(answer), is_correct],
       function (err2) {
         if (err2) return res.status(500).json({ error: "Cevap kaydedilemedi! " + err2.message });
         res.json({ success: true, is_correct });
@@ -273,7 +349,7 @@ app.post("/api/answers", (req, res) => {
   });
 });
 
-// Kullanıcının sadece doğru cevapladığı soruları _frontend için kolayca filtreleyebilmen için yeni endpoint!_
+// Kullanıcının tüm cevapları (filter için)
 app.get("/api/user/:userId/answers", (req, res) => {
   const userId = req.params.userId;
   db.all(
@@ -341,10 +417,11 @@ app.get("/api/user/:userId/score", (req, res) => {
   );
 });
 
+// Anket cevap raporu
 app.get("/api/surveys/:surveyId/answers-report", (req, res) => {
   const surveyId = req.params.surveyId;
   db.all(
-    `SELECT id, question FROM questions WHERE survey_id = ?`,
+    `SELECT id, question FROM questions WHERE survey_id = ? ORDER BY id ASC`,
     [surveyId],
     (err, questions) => {
       if (err) return res.status(500).json({ error: "Soru listesi alınamadı" });
@@ -395,28 +472,28 @@ app.get("/api/surveys/:surveyId/answers-report", (req, res) => {
 app.get("/api/admin/statistics", (req, res) => {
   let stats = {};
   db.get(`SELECT COUNT(*) as count FROM users`, (err, row) => {
-    stats.total_users = row.count;
+    stats.total_users = row?.count || 0;
 
     db.get(`SELECT COUNT(DISTINCT user_id) as count FROM answers`, (err2, row2) => {
-      stats.total_active_users = row2.count;
+      stats.total_active_users = row2?.count || 0;
 
       db.get(`SELECT COUNT(*) as count FROM surveys WHERE status = 'approved'`, (err3, row3) => {
-        stats.total_approved_surveys = row3.count;
+        stats.total_approved_surveys = row3?.count || 0;
 
         db.get(`SELECT COUNT(*) as count FROM questions`, (err4, row4) => {
-          stats.total_questions = row4.count;
+          stats.total_questions = row4?.count || 0;
 
           db.get(`SELECT COUNT(*) as count FROM answers`, (err5, row5) => {
-            stats.total_answers = row5.count;
+            stats.total_answers = row5?.count || 0;
 
             db.get(`SELECT COUNT(*) as count FROM answers WHERE is_correct = 1`, (err6, row6) => {
-              stats.total_correct_answers = row6.count;
+              stats.total_correct_answers = row6?.count || 0;
 
               db.get(`SELECT COUNT(*) as count FROM answers WHERE is_correct = 0 AND answer != 'bilmem'`, (err7, row7) => {
-                stats.total_wrong_answers = row7.count;
+                stats.total_wrong_answers = row7?.count || 0;
 
                 db.get(`SELECT COUNT(*) as count FROM answers WHERE answer = 'bilmem'`, (err8, row8) => {
-                  stats.total_bilmem = row8.count;
+                  stats.total_bilmem = row8?.count || 0;
                   res.json({ success: true, ...stats });
                 });
               });
@@ -428,7 +505,7 @@ app.get("/api/admin/statistics", (req, res) => {
   });
 });
 
-// ------ LEADERBOARD: FİLTRELİ ------
+// ------ GENEL LEADERBOARD: FİLTRELİ ve 0 puanlılar yok ------
 app.get("/api/leaderboard", (req, res) => {
   const period = req.query.period || "all";
   const { start, end } = getDateRange(period);
@@ -447,6 +524,7 @@ app.get("/api/leaderboard", (req, res) => {
     LEFT JOIN answers a ON a.user_id = u.id AND (a.created_at BETWEEN ? AND ?)
     LEFT JOIN questions q ON a.question_id = q.id
     GROUP BY u.id
+    HAVING total_points != 0
     ORDER BY total_points DESC, u.id ASC
     LIMIT 100
     `,
@@ -483,7 +561,7 @@ app.get("/api/user/:userId/rank", (req, res) => {
     [start, end],
     (err, rows) => {
       if (err) return res.status(500).json({ error: "Sıralama alınamadı" });
-      const rank = rows.findIndex(r => r.id == userId) + 1;
+      const rank = rows.findIndex(r => String(r.id) === String(userId)) + 1;
       const total_users = rows.length;
       let user_points = 0;
       if (rank > 0) user_points = rows[rank - 1].total_points;
@@ -492,7 +570,7 @@ app.get("/api/user/:userId/rank", (req, res) => {
   );
 });
 
-// Onaylanmış (approved) anketleri getir VE HER ANKETTE SORU SAYISI OLSUN
+// Onaylanmış (approved) anketler + soru sayısı (sorusuzlar elenir)
 app.get("/api/user/approved-surveys", (req, res) => {
   db.all(
     `SELECT * FROM surveys WHERE status = 'approved' ORDER BY id DESC`,
@@ -503,15 +581,13 @@ app.get("/api/user/approved-surveys", (req, res) => {
 
       let done = 0;
       let filteredSurveys = [];
-      surveys.forEach((survey, idx) => {
+      surveys.forEach((survey) => {
         db.get(
           `SELECT COUNT(*) as question_count FROM questions WHERE survey_id = ?`,
           [survey.id],
           (err2, row) => {
             survey.question_count = row ? row.question_count : 0;
-            if (survey.question_count > 0) {
-              filteredSurveys.push(survey);
-            }
+            if (survey.question_count > 0) filteredSurveys.push(survey);
             done++;
             if (done === surveys.length) {
               res.json({ success: true, surveys: filteredSurveys });
@@ -523,10 +599,12 @@ app.get("/api/user/approved-surveys", (req, res) => {
   );
 });
 
-
-// Belirli bir anket (survey) için leaderboard
+// ------ Belirli anket için leaderboard (+period), 0 puanlılar yok ------
 app.get("/api/surveys/:surveyId/leaderboard", (req, res) => {
   const surveyId = req.params.surveyId;
+  const period = req.query.period || "all";
+  const { start, end } = getDateRange(period);
+
   db.all(
     `
     SELECT u.id, u.ad, u.soyad,
@@ -539,24 +617,23 @@ app.get("/api/surveys/:surveyId/leaderboard", (req, res) => {
         END
       ), 0) AS total_points
     FROM users u
-    LEFT JOIN answers a ON a.user_id = u.id
+    LEFT JOIN answers a
+      ON a.user_id = u.id
+      AND (a.created_at BETWEEN ? AND ?)
       AND a.question_id IN (SELECT id FROM questions WHERE survey_id = ?)
     LEFT JOIN questions q ON a.question_id = q.id
-      AND q.survey_id = ?
     GROUP BY u.id
+    HAVING total_points != 0
     ORDER BY total_points DESC, u.id ASC
     LIMIT 100
     `,
-    [surveyId, surveyId],
+    [start, end, surveyId],
     (err, rows) => {
       if (err) return res.status(500).json({ error: "Anket leaderboard alınamadı!" });
       res.json({ success: true, leaderboard: rows });
     }
   );
 });
-
-
-
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
