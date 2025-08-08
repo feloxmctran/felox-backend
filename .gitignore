@@ -1,5 +1,1 @@
 node_modules/
-felox.db
-*.sqlite*
-data/
-add rules to ignore db files
