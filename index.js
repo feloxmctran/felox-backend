@@ -316,6 +316,57 @@ app.get("/api/surveys/:surveyId/answers-report", async (req, res) => {
   } catch { res.status(500).json({ error: "Cevaplar alınamadı" }); }
 });
 
+// index.js içinde uygun yere ekle
+app.get("/api/user/:userId/performance", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const rows = await all(
+      `
+      SELECT
+        s.id AS survey_id,
+        s.title,
+        COUNT(a.*)::int AS answered,
+        COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 1 ELSE 0 END),0)::int AS bilmem,
+        COALESCE(SUM(CASE WHEN a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS attempted,
+        COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct,
+        COALESCE(SUM(CASE WHEN a.is_correct = 0 AND a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS wrong,
+        COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0
+                          WHEN a.is_correct = 1 THEN q.point ELSE 0 END),0)::int AS earned_points,
+        COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0 ELSE q.point END),0)::int AS possible_points
+      FROM answers a
+      INNER JOIN questions q ON q.id = a.question_id
+      INNER JOIN surveys  s ON s.id = q.survey_id
+      WHERE a.user_id = $1
+      GROUP BY s.id, s.title
+      `,
+      [userId]
+    );
+
+    // Yüzde + sıralama
+    const perf = rows.map(r => {
+      const pct = r.possible_points > 0 ? Math.round((r.earned_points * 100.0) / r.possible_points) : null;
+      return { ...r, score_percent: pct };
+    }).sort((A, B) => {
+      // 1) yüzdelere göre (null en sona)
+      if (A.score_percent == null && B.score_percent != null) return 1;
+      if (A.score_percent != null && B.score_percent == null) return -1;
+      if (A.score_percent != null && B.score_percent != null && B.score_percent !== A.score_percent)
+        return B.score_percent - A.score_percent;
+      // 2) attempted (bilmem hariç) – çoktan aza
+      if (B.attempted !== A.attempted) return B.attempted - A.attempted;
+      // 3) alfabetik
+      return (A.title || "").localeCompare(B.title || "", "tr");
+    });
+
+    res.json({ success: true, performance: perf });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Performans listesi alınamadı" });
+  }
+});
+
+
+
 /* ---------- STATS & LEADERBOARDS ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
