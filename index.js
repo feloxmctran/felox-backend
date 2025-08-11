@@ -361,6 +361,135 @@ app.get("/api/user/:userId/performance", async (req, res) => {
   }
 });
 
+/* ---------- KADEMELİ YARIŞ UÇ NOKTALARI ---------- */
+
+/**
+ * Soruları getir: Tüm onaylı kategorilerden, sadece verilen puana eşit sorular.
+ * Kullanıcının daha önce DOĞRU bildikleri hariç tutulur (tekrarı azaltmak için).
+ * ?point=1..10 (zorunlu), ?limit=200 (opsiyonel)
+ */
+app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
+  try {
+    const userId = Number(req.params.userId);
+    const point = Number(req.query.point || 1);
+    const limit = Math.min(1000, Math.max(10, Number(req.query.limit || 200)));
+
+    if (!point || point < 1 || point > 10) {
+      return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
+    }
+
+    const rows = await all(
+      `
+      SELECT q.*
+      FROM questions q
+      INNER JOIN surveys s ON s.id = q.survey_id
+      WHERE s.status = 'approved'
+        AND q.point = $2
+        AND q.id NOT IN (
+          SELECT a.question_id
+          FROM answers a
+          WHERE a.user_id = $1 AND a.is_correct = 1
+        )
+      ORDER BY RANDOM()
+      LIMIT $3
+      `,
+      [userId, point, limit]
+    );
+
+    res.json({ success: true, questions: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Kademeli sorular alınamadı" });
+  }
+});
+
+/**
+ * İlerleme: Verilen puandaki sorularda kullanıcının performansı.
+ * attempted = bilmem hariç, correct = doğru, success_rate = correct/attempted
+ */
+app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
+  try {
+    const userId = Number(req.params.userId);
+    const point = Number(req.query.point || 1);
+    if (!point || point < 1 || point > 10) {
+      return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
+    }
+
+    const row = await get(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS attempted,
+        COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct
+      FROM answers a
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.user_id = $1
+        AND q.point   = $2
+      `,
+      [userId, point]
+    );
+
+    const attempted = row?.attempted || 0;
+    const correct = row?.correct || 0;
+    const success_rate = attempted > 0 ? correct / attempted : 0;
+
+    res.json({
+      success: true,
+      point,
+      attempted,
+      correct,
+      success_rate, // 0..1
+      can_level_up: (attempted >= 100 && success_rate >= 0.8)
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Kademeli ilerleme alınamadı" });
+  }
+});
+
+/**
+ * Bir üst seviyeye geçilebilir mi? (baraj: attempted>=100 ve %80 başarı)
+ * Eğer 10. seviyede de baraj geçildiyse 'genius' döner.
+ */
+app.get("/api/user/:userId/kademeli-next", async (req, res) => {
+  try {
+    const userId = Number(req.params.userId);
+    const point = Number(req.query.point || 1);
+    if (!point || point < 1 || point > 10) {
+      return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
+    }
+
+    const row = await get(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS attempted,
+        COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct
+      FROM answers a
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.user_id = $1
+        AND q.point   = $2
+      `,
+      [userId, point]
+    );
+
+    const attempted = row?.attempted || 0;
+    const correct = row?.correct || 0;
+    const success_rate = attempted > 0 ? correct / attempted : 0;
+    const ok = (attempted >= 100 && success_rate >= 0.8);
+
+    if (ok) {
+      if (point >= 10) {
+        return res.json({ success: true, status: "genius", can_level_up: true, next_point: 10 });
+      }
+      return res.json({ success: true, status: "ok", can_level_up: true, next_point: point + 1 });
+    }
+
+    res.json({ success: true, status: "stay", can_level_up: false, next_point: point });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Seviye kontrolü yapılamadı" });
+  }
+});
+
 /* ---------- STATS & LEADERBOARDS ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
