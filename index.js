@@ -51,6 +51,29 @@ function getDateRange(type) {
   }
   return { start, end };
 }
+
+// Europe/Istanbul'a göre dönem filtresi (answers alias'ı ver: genelde "a")
+function periodSql(period, alias = "a") {
+  const col = `${alias}.created_at`;
+  const tzNow = `timezone('Europe/Istanbul', now())`;
+  switch ((period || "all")) {
+    case "today":
+      return `AND ${col} >= date_trunc('day', ${tzNow})
+              AND ${col} <  date_trunc('day', ${tzNow}) + interval '1 day'`;
+    case "week":
+      return `AND ${col} >= date_trunc('week', ${tzNow})
+              AND ${col} <  date_trunc('week', ${tzNow}) + interval '1 week'`;
+    case "month":
+      return `AND ${col} >= date_trunc('month', ${tzNow})
+              AND ${col} <  date_trunc('month', ${tzNow}) + interval '1 month'`;
+    case "year":
+      return `AND ${col} >= date_trunc('year', ${tzNow})
+              AND ${col} <  date_trunc('year', ${tzNow}) + interval '1 year'`;
+    default:
+      return ""; // all
+  }
+}
+
 function normalizeAnswer(v) {
   if (v == null) return "";
   let s = String(v).trim().toLowerCase();
@@ -316,7 +339,7 @@ app.get("/api/surveys/:surveyId/answers-report", async (req, res) => {
   } catch { res.status(500).json({ error: "Cevaplar alınamadı" }); }
 });
 
-/* ---------- PUANLARIM: title bazında NET PUAN ---------- */
+/* ---------- PUANLARIM (title bazında, net puan + detay) ---------- */
 app.get("/api/user/:userId/performance", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -330,14 +353,15 @@ app.get("/api/user/:userId/performance", async (req, res) => {
         COALESCE(SUM(CASE WHEN a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS attempted,
         COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct,
         COALESCE(SUM(CASE WHEN a.is_correct = 0 AND a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS wrong,
-        COALESCE(SUM(
-          CASE
+        COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0
+                          WHEN a.is_correct = 1 THEN q.point ELSE 0 END),0)::int AS earned_points,
+        COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0 ELSE q.point END),0)::int AS possible_points,
+        COALESCE(SUM(CASE
             WHEN a.answer = 'bilmem' THEN 0
             WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
-          END
-        ), 0)::int AS net_points
+        END),0)::int AS net_points
       FROM answers a
       INNER JOIN questions q ON q.id = a.question_id
       INNER JOIN surveys  s ON s.id = q.survey_id
@@ -347,8 +371,12 @@ app.get("/api/user/:userId/performance", async (req, res) => {
       [userId]
     );
 
-    // Sıralama: net puan DESC, attempted DESC, title ASC (TR)
-    const perf = rows.sort((A, B) => {
+    const perf = rows.map(r => {
+      const pct = r.possible_points > 0
+        ? Math.round((r.earned_points * 100.0) / r.possible_points)
+        : null;
+      return { ...r, score_percent: pct };
+    }).sort((A, B) => {
       if (B.net_points !== A.net_points) return B.net_points - A.net_points;
       if (B.attempted !== A.attempted)   return B.attempted - A.attempted;
       return (A.title || "").localeCompare(B.title || "", "tr");
@@ -361,19 +389,13 @@ app.get("/api/user/:userId/performance", async (req, res) => {
   }
 });
 
-/* ---------- KADEMELİ YARIŞ UÇ NOKTALARI ---------- */
-
-/**
- * Soruları getir: Tüm onaylı kategorilerden, sadece verilen puana eşit sorular.
- * Kullanıcının daha önce DOĞRU bildikleri hariç tutulur (tekrarı azaltmak için).
- * ?point=1..10 (zorunlu), ?limit=200 (opsiyonel)
- */
+/* ---------- KADEMELİ YARIŞ ---------- */
+// Soruları getir: onaylı kategorilerden, belirli puandaki ve daha önce doğru bilinmeyenler
 app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
     const point = Number(req.query.point || 1);
     const limit = Math.min(1000, Math.max(10, Number(req.query.limit || 200)));
-
     if (!point || point < 1 || point > 10) {
       return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
     }
@@ -386,8 +408,7 @@ app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
       WHERE s.status = 'approved'
         AND q.point = $2
         AND q.id NOT IN (
-          SELECT a.question_id
-          FROM answers a
+          SELECT a.question_id FROM answers a
           WHERE a.user_id = $1 AND a.is_correct = 1
         )
       ORDER BY RANDOM()
@@ -403,10 +424,7 @@ app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   }
 });
 
-/**
- * İlerleme: Verilen puandaki sorularda kullanıcının performansı.
- * attempted = bilmem hariç, correct = doğru, success_rate = correct/attempted
- */
+// İlerleme: belirli puanda deneme, doğru ve başarı oranı
 app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -422,8 +440,7 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
         COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct
       FROM answers a
       INNER JOIN questions q ON q.id = a.question_id
-      WHERE a.user_id = $1
-        AND q.point   = $2
+      WHERE a.user_id = $1 AND q.point = $2
       `,
       [userId, point]
     );
@@ -437,7 +454,7 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
       point,
       attempted,
       correct,
-      success_rate, // 0..1
+      success_rate,
       can_level_up: (attempted >= 100 && success_rate >= 0.8)
     });
   } catch (e) {
@@ -446,10 +463,7 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
   }
 });
 
-/**
- * Bir üst seviyeye geçilebilir mi? (baraj: attempted>=100 ve %80 başarı)
- * Eğer 10. seviyede de baraj geçildiyse 'genius' döner.
- */
+// Seviye atlama kontrolü
 app.get("/api/user/:userId/kademeli-next", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -465,8 +479,7 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
         COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct
       FROM answers a
       INNER JOIN questions q ON q.id = a.question_id
-      WHERE a.user_id = $1
-        AND q.point   = $2
+      WHERE a.user_id = $1 AND q.point = $2
       `,
       [userId, point]
     );
@@ -482,7 +495,6 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
       }
       return res.json({ success: true, status: "ok", can_level_up: true, next_point: point + 1 });
     }
-
     res.json({ success: true, status: "stay", can_level_up: false, next_point: point });
   } catch (e) {
     console.error(e);
@@ -490,7 +502,7 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
   }
 });
 
-/* ---------- STATS & LEADERBOARDS ---------- */
+/* ---------- STATS & LEADERBOARDS (İstanbul TZ ile) ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
     const a = await get(`SELECT COUNT(*)::int AS count FROM users`);
@@ -514,10 +526,13 @@ app.get("/api/admin/statistics", async (_req, res) => {
     });
   } catch { res.status(500).json({ error: "İstatistik hatası!" }); }
 });
+
+// GENEL PUAN TABLOSU (İstanbul TZ)
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const period = req.query.period || "all";
-    const { start, end } = getDateRange(period);
+    const periodClause = periodSql(period, "a");
+
     const rows = await all(
       `
       SELECT u.id, u.ad, u.soyad,
@@ -530,8 +545,10 @@ app.get("/api/leaderboard", async (req, res) => {
           END
         ), 0)::int AS total_points
       FROM users u
-      LEFT JOIN answers a ON a.user_id = u.id AND (a.created_at BETWEEN $1 AND $2)
+      LEFT JOIN answers a ON a.user_id = u.id
       LEFT JOIN questions q ON a.question_id = q.id
+      WHERE 1=1
+        ${periodClause}
       GROUP BY u.id
       HAVING COALESCE(SUM(
         CASE
@@ -543,17 +560,21 @@ app.get("/api/leaderboard", async (req, res) => {
       ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
       LIMIT 100
-      `,
-      [start, end]
+      `
     );
     res.json({ success: true, leaderboard: rows });
-  } catch { res.status(500).json({ error: "Liste alınamadı" }); }
+  } catch {
+    res.status(500).json({ error: "Liste alınamadı" });
+  }
 });
+
+// GENEL RANK (İstanbul TZ)
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
     const period = req.query.period || "all";
-    const { start, end } = getDateRange(period);
+    const periodClause = periodSql(period, "a");
+
     const rows = await all(
       `
       SELECT u.id,
@@ -566,19 +587,68 @@ app.get("/api/user/:userId/rank", async (req, res) => {
           END
         ), 0)::int AS total_points
       FROM users u
-      LEFT JOIN answers a ON a.user_id = u.id AND (a.created_at BETWEEN $1 AND $2)
+      LEFT JOIN answers a ON a.user_id = u.id
       LEFT JOIN questions q ON a.question_id = q.id
+      WHERE 1=1
+        ${periodClause}
       GROUP BY u.id
       ORDER BY total_points DESC, u.id ASC
-      `,
-      [start, end]
+      `
     );
+
     const rank = rows.findIndex(r => String(r.id) === String(userId)) + 1;
     const total_users = rows.length;
     const user_points = rank > 0 ? rows[rank - 1].total_points : 0;
     res.json({ success: true, rank, total_users, user_points });
-  } catch { res.status(500).json({ error: "Sıralama alınamadı" }); }
+  } catch {
+    res.status(500).json({ error: "Sıralama alınamadı" });
+  }
 });
+
+// KATEGORİ (ANKET) BAZLI PUAN TABLOSU (İstanbul TZ)
+app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
+  try {
+    const surveyId = req.params.surveyId;
+    const period = req.query.period || "all";
+    const periodClause = periodSql(period, "a");
+
+    const rows = await all(
+      `
+      SELECT u.id, u.ad, u.soyad,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ), 0)::int AS total_points
+      FROM users u
+      INNER JOIN answers a ON a.user_id = u.id
+      INNER JOIN questions q ON a.question_id = q.id
+      WHERE 1=1
+        ${periodClause}
+        AND a.question_id IN (SELECT id FROM questions WHERE survey_id = $1)
+      GROUP BY u.id
+      HAVING COALESCE(SUM(
+        CASE
+          WHEN a.answer = 'bilmem' THEN 0
+          WHEN a.is_correct = 1 THEN q.point
+          WHEN a.is_correct = 0 THEN -q.point
+          ELSE 0
+        END
+      ), 0) != 0
+      ORDER BY total_points DESC, u.id ASC
+      LIMIT 100
+      `,
+      [surveyId]
+    );
+    res.json({ success: true, leaderboard: rows });
+  } catch {
+    res.status(500).json({ error: "Anket leaderboard alınamadı!" });
+  }
+});
+
 app.get("/api/user/approved-surveys", async (_req, res) => {
   try {
     const surveys = await all(`SELECT * FROM surveys WHERE status='approved' ORDER BY id DESC`);
@@ -594,45 +664,6 @@ app.get("/api/user/approved-surveys", async (_req, res) => {
 function filteredSurveysPush(arr, survey, count) {
   arr.push({ ...survey, question_count: count });
 }
-app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
-  try {
-    const surveyId = req.params.surveyId;
-    const period = req.query.period || "all";
-    const { start, end } = getDateRange(period);
-    const rows = await all(
-      `
-      SELECT u.id, u.ad, u.soyad,
-        COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ), 0)::int AS total_points
-      FROM users u
-      LEFT JOIN answers a
-        ON a.user_id = u.id
-        AND (a.created_at BETWEEN $1 AND $2)
-        AND a.question_id IN (SELECT id FROM questions WHERE survey_id = $3)
-      LEFT JOIN questions q ON a.question_id = q.id
-      GROUP BY u.id
-      HAVING COALESCE(SUM(
-        CASE
-          WHEN a.answer = 'bilmem' THEN 0
-          WHEN a.is_correct = 1 THEN q.point
-          WHEN a.is_correct = 0 THEN -q.point
-          ELSE 0
-        END
-      ), 0) != 0
-      ORDER BY total_points DESC, u.id ASC
-      LIMIT 100
-      `,
-      [start, end, surveyId]
-    );
-    res.json({ success: true, leaderboard: rows });
-  } catch { res.status(500).json({ error: "Anket leaderboard alınamadı!" }); }
-});
 
 /* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
