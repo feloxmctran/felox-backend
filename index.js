@@ -14,13 +14,31 @@ if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL env yok! Neon connection string'i .env içine ekleyin.");
   process.exit(1);
 }
+
+const { Pool } = require("pg");
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  keepAlive: true,                 // idle bağlantıların düşmesini azalt
+  max: 5,                          // makul havuz boyu
+  idleTimeoutMillis: 30000,        // 30s idle sonra client serbest bırak
+  connectionTimeoutMillis: 10000,  // 10s'te bağlanamazsa hata
 });
-pool.connect()
+
+// Havuz hatalarını yakala (ör: "Connection terminated unexpectedly")
+pool.on("error", (err) => {
+  console.error("PG pool error:", err.message);
+});
+
+// Bağlantıyı test et (client tutma!)
+// NOT: pool.connect() kullanmıyoruz.
+pool
+  .query("SELECT 1")
   .then(() => console.log("PostgreSQL bağlantısı başarılı"))
-  .catch((e) => { console.error("PostgreSQL bağlantı hatası:", e); process.exit(1); });
+  .catch((e) => {
+    console.error("PostgreSQL bağlantı hatası:", e);
+    process.exit(1);
+  });
 
 /* sqlite benzeri yardımcılar */
 async function run(sql, params = []) { await pool.query(sql, params); return { success: true }; }
