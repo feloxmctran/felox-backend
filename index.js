@@ -123,8 +123,17 @@ async function init() {
     is_correct INTEGER,
     created_at TIMESTAMP DEFAULT NOW()
   )`);
+
+  // QUOTES tablosunu da burada oluştur (top-level await kullanma)
+  await run(`CREATE TABLE IF NOT EXISTS quotes (
+    id SERIAL PRIMARY KEY,
+    text TEXT NOT NULL,
+    author TEXT
+  )`);
+
+  console.log("PostgreSQL tablolar hazır");
 }
-init().then(() => console.log("PostgreSQL tablolar hazır")).catch(e => { console.error(e); process.exit(1); });
+init().catch(e => { console.error(e); process.exit(1); });
 
 /* ---------- AUTH ---------- */
 app.post("/api/register", async (req, res) => {
@@ -135,24 +144,35 @@ app.post("/api/register", async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
       [ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role]
     );
-    const user = await get(`SELECT id, ad, soyad, email, role FROM users WHERE email=$1`, [email]);
+    const user = await get(
+      `SELECT id, ad, soyad, email, role, cinsiyet FROM users WHERE email=$1`,
+      [email]
+    );
     res.json({ success: true, user });
   } catch (err) {
     if (String(err.message).includes("duplicate key")) return res.status(400).json({ error: "Bu e-posta zaten kayıtlı." });
     res.status(500).json({ error: "Kayıt başarısız." });
   }
 });
+
 app.get("/api/user/:userId/exists", async (req, res) => {
   const user = await get(`SELECT id FROM users WHERE id=$1`, [req.params.userId]);
   res.json({ exists: !!user });
 });
+
 app.post("/api/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await get(`SELECT * FROM users WHERE email=$1 AND password=$2`, [email, password]);
+    const user = await get(
+      `SELECT id, ad, soyad, email, role, cinsiyet
+       FROM users WHERE email=$1 AND password=$2`,
+      [email, password]
+    );
     if (!user) return res.status(401).json({ error: "E-posta veya şifre yanlış." });
-    res.json({ success: true, user: { id: user.id, ad: user.ad, soyad: user.soyad, role: user.role, email: user.email } });
-  } catch { res.status(500).json({ error: "Sunucu hatası." }); }
+    res.json({ success: true, user });
+  } catch {
+    res.status(500).json({ error: "Sunucu hatası." });
+  }
 });
 
 /* ---------- EDITOR ---------- */
@@ -177,8 +197,11 @@ app.post("/api/surveys", async (req, res) => {
       }
     }
     res.json({ success: true, survey_id: surveyId });
-  } catch { res.status(500).json({ error: "Anket kaydedilemedi!" }); }
+  } catch {
+    res.status(500).json({ error: "Anket kaydedilemedi!" });
+  }
 });
+
 app.get("/api/editor/:editorId/surveys", async (req, res) => {
   try {
     const rows = await all(
@@ -188,6 +211,7 @@ app.get("/api/editor/:editorId/surveys", async (req, res) => {
     res.json({ success: true, surveys: rows });
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
+
 app.get("/api/surveys/:surveyId/details", async (req, res) => {
   try {
     const surveyId = req.params.surveyId;
@@ -197,10 +221,12 @@ app.get("/api/surveys/:surveyId/details", async (req, res) => {
     res.json({ success: true, survey, questions });
   } catch { res.status(500).json({ error: "Sorular bulunamadı!" }); }
 });
+
 app.post("/api/surveys/:surveyId/delete", async (req, res) => {
   try { await run(`UPDATE surveys SET status='deleted' WHERE id=$1`, [req.params.surveyId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Silinemedi." }); }
 });
+
 app.get("/api/admin/surveys", async (_req, res) => {
   try {
     const rows = await all(
@@ -213,16 +239,19 @@ app.get("/api/admin/surveys", async (_req, res) => {
     res.json({ success: true, surveys: rows });
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
+
 app.post("/api/surveys/:surveyId/status", async (req, res) => {
   const { status } = req.body;
   if (!["approved", "rejected"].includes(status)) return res.status(400).json({ error: "Geçersiz durum!" });
   try { await run(`UPDATE surveys SET status=$1 WHERE id=$2`, [status, req.params.surveyId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Durum güncellenemedi." }); }
 });
+
 app.post("/api/questions/:questionId/delete", async (req, res) => {
   try { await run(`DELETE FROM questions WHERE id=$1`, [req.params.questionId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Soru silinemedi." }); }
 });
+
 app.post("/api/surveys/:surveyId/questions/bulk", async (req, res) => {
   const surveyId = req.params.surveyId;
   const { questions } = req.body;
@@ -243,6 +272,18 @@ app.post("/api/surveys/:surveyId/questions/bulk", async (req, res) => {
   } catch (e) { res.status(500).json({ error: "Toplu ekleme hatası: " + e.message }); }
 });
 
+/* ---------- QUOTES ---------- */
+app.get("/api/quotes/random", async (_req, res) => {
+  try {
+    const row = await get(`SELECT text, author FROM quotes ORDER BY RANDOM() LIMIT 1`);
+    if (!row) return res.status(404).json({ error: "Henüz hiç söz eklenmemiş." });
+    res.json(row);
+  } catch (err) {
+    console.error("Quote çekme hatası:", err);
+    res.status(500).json({ error: "Söz alınamadı." });
+  }
+});
+
 /* ---------- USER ---------- */
 app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   try {
@@ -250,6 +291,7 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
     res.json({ success: true, questions: rows });
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
+
 app.post("/api/answers", async (req, res) => {
   const { user_id, question_id, answer } = req.body;
   try {
@@ -265,18 +307,21 @@ app.post("/api/answers", async (req, res) => {
     res.json({ success: true, is_correct });
   } catch (e) { res.status(500).json({ error: "Cevap kaydedilemedi! " + e.message }); }
 });
+
 app.get("/api/user/:userId/answers", async (req, res) => {
   try {
     const rows = await all(`SELECT question_id, is_correct, answer FROM answers WHERE user_id=$1`, [req.params.userId]);
     res.json({ success: true, answers: rows });
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
+
 app.get("/api/user/:userId/answered", async (req, res) => {
   try {
     const rows = await all(`SELECT question_id FROM answers WHERE user_id=$1`, [req.params.userId]);
     res.json({ success: true, answered: rows.map(r => r.question_id) });
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
+
 app.get("/api/user/:userId/total-points", async (req, res) => {
   try {
     const rows = await all(
@@ -294,6 +339,7 @@ app.get("/api/user/:userId/total-points", async (req, res) => {
     res.json({ success: true, totalPoints: total, answeredCount: rows.length });
   } catch { res.status(500).json({ error: "Puan alınamadı" }); }
 });
+
 app.get("/api/user/:userId/score", async (req, res) => {
   try {
     const row = await get(
@@ -306,6 +352,7 @@ app.get("/api/user/:userId/score", async (req, res) => {
     res.json({ success: true, ...row });
   } catch { res.status(500).json({ error: "Skor hatası!" }); }
 });
+
 app.get("/api/surveys/:surveyId/answers-report", async (req, res) => {
   try {
     const surveyId = req.params.surveyId;
