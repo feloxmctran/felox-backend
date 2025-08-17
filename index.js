@@ -1,4 +1,4 @@
-require('dotenv').config();
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
@@ -15,23 +15,19 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-const { Pool } = require("pg");
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  keepAlive: true,                 // idle bağlantıların düşmesini azalt
-  max: 5,                          // makul havuz boyu
-  idleTimeoutMillis: 30000,        // 30s idle sonra client serbest bırak
-  connectionTimeoutMillis: 10000,  // 10s'te bağlanamazsa hata
+  keepAlive: true,
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
-// Havuz hatalarını yakala (ör: "Connection terminated unexpectedly")
 pool.on("error", (err) => {
   console.error("PG pool error:", err.message);
 });
 
-// Bağlantıyı test et (client tutma!)
-// NOT: pool.connect() kullanmıyoruz.
 pool
   .query("SELECT 1")
   .then(() => console.log("PostgreSQL bağlantısı başarılı"))
@@ -50,27 +46,6 @@ app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.send("healthy"));
 
 /* ---------- HELPERS ---------- */
-function getDateRange(type) {
-  const now = new Date();
-  let start, end;
-  end = now.toISOString().slice(0, 10) + " 23:59:59";
-  if (type === "today") {
-    start = now.toISOString().slice(0, 10) + " 00:00:00";
-  } else if (type === "week") {
-    const diff = now.getDay() === 0 ? 6 : now.getDay() - 1;
-    const monday = new Date(now); monday.setDate(now.getDate() - diff);
-    start = monday.toISOString().slice(0, 10) + " 00:00:00";
-  } else if (type === "month") {
-    start = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-01 00:00:00";
-  } else if (type === "year") {
-    start = now.getFullYear() + "-01-01 00:00:00";
-  } else {
-    start = "1970-01-01 00:00:00";
-  }
-  return { start, end };
-}
-
-// Europe/Istanbul'a göre dönem filtresi (answers alias'ı ver: genelde "a")
 function periodSql(period, alias = "a") {
   const col = `${alias}.created_at`;
   const tzNow = `timezone('Europe/Istanbul', now())`;
@@ -88,7 +63,7 @@ function periodSql(period, alias = "a") {
       return `AND ${col} >= date_trunc('year', ${tzNow})
               AND ${col} <  date_trunc('year', ${tzNow}) + interval '1 year'`;
     default:
-      return ""; // all
+      return "";
   }
 }
 
@@ -142,7 +117,17 @@ async function init() {
     created_at TIMESTAMP DEFAULT NOW()
   )`);
 
-  // QUOTES tablosunu da burada oluştur (top-level await kullanma)
+  // answers tablosunda süre ve günlük yarışma işaretleri
+  await run(`
+    ALTER TABLE answers
+      ADD COLUMN IF NOT EXISTS max_time_seconds integer,
+      ADD COLUMN IF NOT EXISTS time_left_seconds integer,
+      ADD COLUMN IF NOT EXISTS earned_seconds integer,
+      ADD COLUMN IF NOT EXISTS context text,
+      ADD COLUMN IF NOT EXISTS contest_day date
+  `);
+
+  // QUOTES tablosu
   await run(`CREATE TABLE IF NOT EXISTS quotes (
     id SERIAL PRIMARY KEY,
     text TEXT NOT NULL,
@@ -310,20 +295,54 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
 
+/* --------- CEVAP KAYDI: günlük yarışma işareti + süre --------- */
 app.post("/api/answers", async (req, res) => {
-  const { user_id, question_id, answer } = req.body;
+  const {
+    user_id,
+    question_id,
+    answer,
+    time_left_seconds,
+    max_time_seconds,
+    context,
+    contest_day,
+  } = req.body;
   try {
     const q = await get(`SELECT correct_answer FROM questions WHERE id=$1`, [question_id]);
     if (!q) return res.status(400).json({ error: "Soru bulunamadı!" });
+
     const norm = normalizeAnswer(answer);
     const is_correct = q.correct_answer === norm ? 1 : 0;
+
+    const parsedMax = Number(max_time_seconds);
+    const parsedLeft = Number(time_left_seconds);
+    const maxSec = Number.isFinite(parsedMax) ? Math.max(1, Math.min(120, Math.round(parsedMax))) : 24;
+    const leftSecRaw = Number.isFinite(parsedLeft) ? Math.round(parsedLeft) : 0;
+    const leftSec = Math.max(0, Math.min(leftSecRaw, maxSec));
+    const earned = leftSec;
+
+    const ctx = context === "daily" ? "daily" : null;
+    const cday = contest_day ? String(contest_day).slice(0, 10) : null;
+
     await run(
-      `INSERT INTO answers (user_id, question_id, answer, is_correct, created_at)
-       VALUES ($1,$2,$3,$4,NOW())`,
-      [user_id, question_id, norm, is_correct]
+      `INSERT INTO answers
+         (user_id, question_id, answer, is_correct, created_at,
+          max_time_seconds, time_left_seconds, earned_seconds,
+          context, contest_day)
+       VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),
+               $5,$6,$7,$8,$9)`,
+      [user_id, question_id, norm, is_correct, maxSec, leftSec, earned, ctx, cday]
     );
-    res.json({ success: true, is_correct });
-  } catch (e) { res.status(500).json({ error: "Cevap kaydedilemedi! " + e.message }); }
+
+    res.json({
+      success: true,
+      is_correct,
+      time_left_seconds: leftSec,
+      max_time_seconds: maxSec,
+      earned_seconds: earned,
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Cevap kaydedilemedi! " + e.message });
+  }
 });
 
 app.get("/api/user/:userId/answers", async (req, res) => {
@@ -404,7 +423,7 @@ app.get("/api/surveys/:surveyId/answers-report", async (req, res) => {
   } catch { res.status(500).json({ error: "Cevaplar alınamadı" }); }
 });
 
-/* ---------- PUANLARIM (title bazında, net puan + detay) ---------- */
+/* ---------- PUANLARIM (title bazında) ---------- */
 app.get("/api/user/:userId/performance", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -455,7 +474,6 @@ app.get("/api/user/:userId/performance", async (req, res) => {
 });
 
 /* ---------- KADEMELİ YARIŞ ---------- */
-// Soruları getir: onaylı kategorilerden, belirli puandaki ve daha önce doğru bilinmeyenler
 app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -489,7 +507,6 @@ app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   }
 });
 
-// İlerleme: belirli puanda deneme, doğru ve başarı oranı
 app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -528,7 +545,6 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
   }
 });
 
-// Seviye atlama kontrolü
 app.get("/api/user/:userId/kademeli-next", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -592,7 +608,6 @@ app.get("/api/admin/statistics", async (_req, res) => {
   } catch { res.status(500).json({ error: "İstatistik hatası!" }); }
 });
 
-// GENEL PUAN TABLOSU (İstanbul TZ)
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const period = req.query.period || "all";
@@ -633,7 +648,6 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
-// GENEL RANK (İstanbul TZ)
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -670,7 +684,6 @@ app.get("/api/user/:userId/rank", async (req, res) => {
   }
 });
 
-// KATEGORİ (ANKET) BAZLI PUAN TABLOSU (İstanbul TZ)
 app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
   try {
     const surveyId = req.params.surveyId;
@@ -729,6 +742,115 @@ app.get("/api/user/approved-surveys", async (_req, res) => {
 function filteredSurveysPush(arr, survey, count) {
   arr.push({ ...survey, question_count: count });
 }
+
+/* ---------- GÜNÜN YARIŞMASI ---------- */
+
+// Günlük seti başlat: Herkese aynı 128 soru (deterministik)
+app.get("/api/daily-contest/start", async (req, res) => {
+  try {
+    const userId = Number(req.query.user_id || 0);
+    if (!userId) return res.status(400).json({ error: "user_id gerekli" });
+
+    const size = Number(process.env.DAILY_CONTEST_SIZE) || 128;
+    const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()), 'YYYY-MM-DD') AS day`);
+    const day = row.day;
+    const seed = `${day}|${process.env.DAILY_CONTEST_SECRET || "felox-secret"}`;
+
+    const questions = await all(
+      `
+      SELECT q.id, q.question, q.point
+      FROM questions q
+      INNER JOIN surveys s ON s.id = q.survey_id
+      WHERE s.status='approved'
+      ORDER BY md5(q.id::text || $1)
+      LIMIT $2
+      `,
+      [seed, size]
+    );
+
+    res.json({ success: true, day, size, questions });
+  } catch (e) {
+    res.status(500).json({ error: "Günün yarışması başlatılamadı: " + e.message });
+  }
+});
+
+// Günlük yarışma puan tablosu: puan DESC, süre (harcanan sn) ASC
+app.get("/api/daily-contest/leaderboard", async (req, res) => {
+  try {
+    const dayParam = (req.query.day || "").slice(0, 10);
+    let day = dayParam;
+    if (!day) {
+      const r = await get(`SELECT to_char(timezone('Europe/Istanbul', now()), 'YYYY-MM-DD') AS day`);
+      day = r.day;
+    }
+
+    const rows = await all(
+      `
+      SELECT 
+        u.id, u.ad, u.soyad,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ),0)::int AS total_points,
+        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS spent_seconds
+      FROM users u
+      INNER JOIN answers a ON a.user_id = u.id
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.context='daily' AND a.contest_day = $1
+      GROUP BY u.id, u.ad, u.soyad
+      ORDER BY total_points DESC, spent_seconds ASC, u.id ASC
+      `,
+      [day]
+    );
+
+    // Rütbe: bugüne kadar kaç günde birinci olmuş
+    const wins = await all(
+      `
+      WITH day_scores AS (
+        SELECT a.contest_day, a.user_id,
+               COALESCE(SUM(
+                 CASE
+                   WHEN a.answer = 'bilmem' THEN 0
+                   WHEN a.is_correct = 1 THEN q.point
+                   WHEN a.is_correct = 0 THEN -q.point
+                   ELSE 0
+                 END
+               ),0) AS pts,
+               COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0) AS spent
+        FROM answers a
+        INNER JOIN questions q ON q.id = a.question_id
+        WHERE a.context='daily' AND a.contest_day IS NOT NULL
+        GROUP BY a.contest_day, a.user_id
+      ),
+      ranked AS (
+        SELECT contest_day, user_id, pts, spent,
+               RANK() OVER (PARTITION BY contest_day ORDER BY pts DESC, spent ASC, user_id ASC) AS rnk
+        FROM day_scores
+      )
+      SELECT user_id, COUNT(*)::int AS wins
+      FROM ranked
+      WHERE rnk=1
+      GROUP BY user_id
+      `
+    );
+    const winMap = {};
+    wins.forEach(w => { winMap[String(w.user_id)] = w.wins; });
+
+    const withRanks = rows.map((r, i) => ({
+      ...r,
+      rank: i + 1,
+      wins: winMap[String(r.id)] || 0,
+    }));
+
+    res.json({ success: true, day, leaderboard: withRanks });
+  } catch (e) {
+    res.status(500).json({ error: "Günlük leaderboard alınamadı: " + e.message });
+  }
+});
 
 /* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
