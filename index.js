@@ -323,7 +323,7 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
 
-/* --------- CEVAP KAYDI --------- */
+/* --------- CEVAP KAYDI: süre bilgisi + earned_seconds --------- */
 async function insertAnswer({
   user_id, question_id, norm_answer, is_correct,
   maxSec, leftSec, earned, isDaily = false, dailyKey = null
@@ -333,7 +333,7 @@ async function insertAnswer({
        (user_id, question_id, answer, is_correct, created_at,
         max_time_seconds, time_left_seconds, earned_seconds,
         is_daily, daily_key)
-     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),
+     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now() ),
              $5,$6,$7,$8,$9)`,
     [user_id, question_id, norm_answer, is_correct, maxSec, leftSec, earned, isDaily, dailyKey]
   );
@@ -606,7 +606,7 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 
-// Günün soru seti
+// Günün soru seti (deterministik ve herkes için aynı)
 async function dailyQuestionSet(dayKey, limit) {
   return await all(
     `
@@ -670,6 +670,7 @@ app.get("/api/daily/status", async (req, res) => {
       return res.json({ success: true, day_key: dayKey, finished: true, index: 0, size: 0, question: null });
     }
 
+    // Emniyet: idx üst sınırı aşmışsa bitir
     if (idx >= set.length) {
       await run(
         `UPDATE daily_sessions SET current_index=$1, finished=true, updated_at=timezone('Europe/Istanbul', now())
@@ -701,7 +702,7 @@ app.get("/api/daily/status", async (req, res) => {
   }
 });
 
-// Answer
+// Answer (E/H/B)
 app.post("/api/daily/answer", async (req, res) => {
   try {
     const { user_id, question_id, answer, time_left_seconds, max_time_seconds } = req.body;
@@ -747,6 +748,7 @@ app.post("/api/daily/answer", async (req, res) => {
       dailyKey: dayKey
     });
 
+    // ilerlet
     const nextIndex = session.current_index + 1;
     const isFinished = nextIndex >= set.length;
     await run(
@@ -768,7 +770,7 @@ app.post("/api/daily/answer", async (req, res) => {
   }
 });
 
-// Skip
+// Skip (Şimdilik bu kadar): mevcut soruyu bilmem say
 app.post("/api/daily/skip", async (req, res) => {
   try {
     const { user_id, question_id, time_left_seconds, max_time_seconds } = req.body;
@@ -824,7 +826,7 @@ app.post("/api/daily/skip", async (req, res) => {
   }
 });
 
-// Günlük Leaderboard (bugün)  — answered_count eklendi
+// Günlük Leaderboard (bugün) — sadece katılanlar + answered_count
 app.get("/api/daily/leaderboard", async (req, res) => {
   try {
     const dayKey = req.query.day || await getDayKey();
@@ -834,7 +836,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
         u.id,
         u.ad,
         u.soyad,
-        COUNT(a.*)::int AS answered_count,
+        COUNT(*)::int AS answered_count,
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
@@ -850,7 +852,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
       WHERE a.is_daily = true
         AND a.daily_key = $1
       GROUP BY u.id, u.ad, u.soyad
-      HAVING COUNT(a.*) > 0
+      HAVING COUNT(*) > 0
       ORDER BY total_points DESC, time_spent ASC, u.id ASC
       LIMIT 100
       `,
@@ -863,7 +865,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
   }
 });
 
-/* ---------- STATS & LEADERBOARDS ---------- */
+/* ---------- STATS & LEADERBOARDS (İstanbul TZ ile) ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
     const a = await get(`SELECT COUNT(*)::int AS count FROM users`);
@@ -929,7 +931,7 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
-// GENEL RANK — sıfır puanlıları hariç tut
+// GENEL RANK
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -953,22 +955,13 @@ app.get("/api/user/:userId/rank", async (req, res) => {
       WHERE 1=1
         ${periodClause}
       GROUP BY u.id
-      HAVING COALESCE(SUM(
-        CASE
-          WHEN a.answer = 'bilmem' THEN 0
-          WHEN a.is_correct = 1 THEN q.point
-          WHEN a.is_correct = 0 THEN -q.point
-          ELSE 0
-        END
-      ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
       `
     );
 
-    const idx = rows.findIndex(r => String(r.id) === String(userId));
-    const rank = idx >= 0 ? (idx + 1) : null;
+    const rank = rows.findIndex(r => String(r.id) === String(userId)) + 1;
     const total_users = rows.length;
-    const user_points = idx >= 0 ? rows[idx].total_points : 0;
+    const user_points = rank > 0 ? rows[rank - 1].total_points : 0;
     res.json({ success: true, rank, total_users, user_points });
   } catch {
     res.status(500).json({ error: "Sıralama alınamadı" });
