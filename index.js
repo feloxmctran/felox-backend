@@ -66,7 +66,6 @@ function periodSql(period, alias = "a") {
       return "";
   }
 }
-
 function normalizeAnswer(v) {
   if (v == null) return "";
   let s = String(v).trim().toLowerCase();
@@ -76,6 +75,64 @@ function normalizeAnswer(v) {
   if (["no", "false", "0"].includes(s)) return "hayır";
   if (["dontknow", "unknown", "idk", "skip", "empty", "null"].includes(s)) return "bilmem";
   return s;
+}
+
+/* --- Europe/Istanbul gün anahtarı (YYYY-MM-DD) --- */
+function getIstanbulDayKey(d = new Date()) {
+  return d.toLocaleDateString("en-CA", { timeZone: "Europe/Istanbul" }); // YYYY-MM-DD
+}
+
+/* --- Deterministik PRNG + shuffle (günlük yarışma seti için) --- */
+function hash32(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function mulberry32(a) {
+  return function () {
+    let t = (a += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), 1 | t);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function shuffleDeterministic(arr, seed) {
+  const rnd = mulberry32(seed);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+const DAILY_SIZE = Math.max(1, Math.min(1000, Number(process.env.DAILY_CONTEST_SIZE) || 128));
+const DAILY_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
+
+const dailyCache = new Map(); // key: day_key -> [{id, question, point}, ...]
+
+async function getDailySet(dayKey) {
+  if (dailyCache.has(dayKey)) return dailyCache.get(dayKey);
+  // Onaylı tüm soruları çek
+  const allQs = await all(`
+    SELECT q.id, q.question, q.point
+    FROM questions q
+    INNER JOIN surveys s ON s.id=q.survey_id
+    WHERE s.status='approved'
+    ORDER BY q.id ASC
+  `);
+  if (!allQs.length) {
+    dailyCache.set(dayKey, []);
+    return [];
+  }
+  const seed = hash32(dayKey + "::" + DAILY_SECRET);
+  const copy = allQs.slice();
+  shuffleDeterministic(copy, seed);
+  const picked = copy.slice(0, Math.min(DAILY_SIZE, copy.length));
+  dailyCache.set(dayKey, picked);
+  return picked;
 }
 
 /* ---------- DB INIT (tablolar) ---------- */
@@ -117,17 +174,17 @@ async function init() {
     created_at TIMESTAMP DEFAULT NOW()
   )`);
 
-  // answers tablosunda süre ve günlük yarışma işaretleri
+  // answers tablosunda yeni alanlar
   await run(`
     ALTER TABLE answers
       ADD COLUMN IF NOT EXISTS max_time_seconds integer,
       ADD COLUMN IF NOT EXISTS time_left_seconds integer,
       ADD COLUMN IF NOT EXISTS earned_seconds integer,
-      ADD COLUMN IF NOT EXISTS context text,
-      ADD COLUMN IF NOT EXISTS contest_day date
+      ADD COLUMN IF NOT EXISTS is_daily boolean DEFAULT false,
+      ADD COLUMN IF NOT EXISTS daily_key text,
+      ADD COLUMN IF NOT EXISTS daily_order integer
   `);
 
-  // QUOTES tablosu
   await run(`CREATE TABLE IF NOT EXISTS quotes (
     id SERIAL PRIMARY KEY,
     text TEXT NOT NULL,
@@ -295,17 +352,9 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
 
-/* --------- CEVAP KAYDI: günlük yarışma işareti + süre --------- */
+/* --------- CEVAP KAYDI (genel) --------- */
 app.post("/api/answers", async (req, res) => {
-  const {
-    user_id,
-    question_id,
-    answer,
-    time_left_seconds,
-    max_time_seconds,
-    context,
-    contest_day,
-  } = req.body;
+  const { user_id, question_id, answer, time_left_seconds, max_time_seconds, is_daily, daily_key, daily_order } = req.body;
   try {
     const q = await get(`SELECT correct_answer FROM questions WHERE id=$1`, [question_id]);
     if (!q) return res.status(400).json({ error: "Soru bulunamadı!" });
@@ -320,31 +369,151 @@ app.post("/api/answers", async (req, res) => {
     const leftSec = Math.max(0, Math.min(leftSecRaw, maxSec));
     const earned = leftSec;
 
-    const ctx = context === "daily" ? "daily" : null;
-    const cday = contest_day ? String(contest_day).slice(0, 10) : null;
-
     await run(
       `INSERT INTO answers
          (user_id, question_id, answer, is_correct, created_at,
           max_time_seconds, time_left_seconds, earned_seconds,
-          context, contest_day)
-       VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),
-               $5,$6,$7,$8,$9)`,
-      [user_id, question_id, norm, is_correct, maxSec, leftSec, earned, ctx, cday]
+          is_daily, daily_key, daily_order)
+       VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),$5,$6,$7,$8,$9,$10)`,
+      [user_id, question_id, norm, is_correct, maxSec, leftSec, earned, !!is_daily, daily_key || null, Number.isInteger(daily_order) ? daily_order : null]
     );
 
-    res.json({
-      success: true,
-      is_correct,
-      time_left_seconds: leftSec,
-      max_time_seconds: maxSec,
-      earned_seconds: earned,
-    });
+    res.json({ success: true, is_correct, time_left_seconds: leftSec, max_time_seconds: maxSec, earned_seconds: earned });
   } catch (e) {
     res.status(500).json({ error: "Cevap kaydedilemedi! " + e.message });
   }
 });
 
+/* ---------- GÜNLÜK YARIŞMA ---------- */
+
+// status: sıradaki soru + ilerleme
+app.get("/api/daily/status", async (req, res) => {
+  try {
+    const userId = Number(req.query.user_id);
+    if (!userId) return res.status(400).json({ error: "user_id gerekli" });
+
+    const dayKey = getIstanbulDayKey();
+    const set = await getDailySet(dayKey);
+    const total = set.length;
+
+    if (total === 0) return res.json({ success: true, day_key: dayKey, total: 0, answered_count: 0, finished: true });
+
+    const rows = await all(
+      `SELECT question_id, daily_order
+       FROM answers
+       WHERE user_id=$1 AND is_daily=true AND daily_key=$2
+       ORDER BY COALESCE(daily_order, id) ASC`,
+      [userId, dayKey]
+    );
+    const answeredCount = rows.length;
+    const finished = answeredCount >= total;
+
+    // skor & süre
+    const agg = await get(
+      `
+      SELECT
+        COALESCE(SUM(CASE
+          WHEN a.answer='bilmem' THEN 0
+          WHEN a.is_correct=1 THEN q.point
+          ELSE -q.point
+        END),0)::int AS points,
+        COALESCE(SUM(CASE
+          WHEN a.max_time_seconds IS NULL OR a.time_left_seconds IS NULL THEN 0
+          ELSE (a.max_time_seconds - a.time_left_seconds)
+        END),0)::int AS duration_seconds
+      FROM answers a
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.user_id=$1 AND a.is_daily=true AND a.daily_key=$2
+      `,
+      [userId, dayKey]
+    );
+
+    let nextIndex = Math.min(answeredCount, total);
+    let nextQuestion = null;
+    if (!finished) {
+      nextQuestion = set[nextIndex];
+    }
+
+    res.json({
+      success: true,
+      day_key: dayKey,
+      total,
+      answered_count: answeredCount,
+      finished,
+      points: agg?.points || 0,
+      duration_seconds: agg?.duration_seconds || 0,
+      next_index: nextIndex,
+      question: nextQuestion // {id, question, point}
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Günlük durum alınamadı" });
+  }
+});
+
+// cevap/skip (sunucu gün anahtarına göre doğrular)
+async function dailyProcessAnswer(req, res, forceBilmem = false) {
+  try {
+    const { user_id, question_id, answer, time_left_seconds, max_time_seconds } = req.body;
+    const userId = Number(user_id);
+    const qid = Number(question_id);
+    if (!userId || !qid) return res.status(400).json({ error: "user_id ve question_id gerekli" });
+
+    const dayKey = getIstanbulDayKey();
+    const set = await getDailySet(dayKey);
+    const total = set.length;
+    if (total === 0) return res.status(400).json({ error: "Bugün için soru seti bulunamadı" });
+
+    // Kaç cevap var?
+    const rows = await all(
+      `SELECT question_id FROM answers
+       WHERE user_id=$1 AND is_daily=true AND daily_key=$2
+       ORDER BY COALESCE(daily_order, id) ASC`,
+      [userId, dayKey]
+    );
+    const answeredCount = rows.length;
+    if (answeredCount >= total) {
+      return res.status(409).json({ error: "Bugünün yarışmasını zaten tamamladın." });
+    }
+    const expected = set[answeredCount];
+    if (!expected || Number(expected.id) !== qid) {
+      return res.status(409).json({ error: "Sıradaki soru bu değil.", expected_question_id: expected ? expected.id : null, next_index: answeredCount });
+    }
+
+    const normAns = forceBilmem ? "bilmem" : (answer ?? "");
+    // genel /api/answers ile aynı mantık, ancak günlük bayrakları set edilecek
+    const q = await get(`SELECT correct_answer FROM questions WHERE id=$1`, [qid]);
+    const is_correct = q && normalizeAnswer(normAns) === q.correct_answer ? 1 : 0;
+
+    const parsedMax = Number(max_time_seconds);
+    const parsedLeft = Number(time_left_seconds);
+    const maxSec = Number.isFinite(parsedMax) ? Math.max(1, Math.min(120, Math.round(parsedMax))) : 24;
+    const leftSecRaw = Number.isFinite(parsedLeft) ? Math.round(parsedLeft) : 0;
+    const leftSec = Math.max(0, Math.min(leftSecRaw, maxSec));
+    const earned = leftSec;
+
+    await run(
+      `INSERT INTO answers
+        (user_id, question_id, answer, is_correct, created_at,
+         max_time_seconds, time_left_seconds, earned_seconds,
+         is_daily, daily_key, daily_order)
+       VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),
+               $5,$6,$7,true,$8,$9)`,
+      [userId, qid, normalizeAnswer(normAns), is_correct, maxSec, leftSec, earned, dayKey, answeredCount]
+    );
+
+    const finished = answeredCount + 1 >= total;
+    res.json({ success: true, finished, next_index: answeredCount + 1, is_correct, daily_key: dayKey });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Günlük cevap işlenemedi: " + e.message });
+  }
+}
+
+app.post("/api/daily/answer", (req, res) => dailyProcessAnswer(req, res, false));
+app.post("/api/daily/skip",   (req, res) => dailyProcessAnswer(req, res, true));
+
+/* ---------- KULLANICI ÖZETLERİ ---------- */
 app.get("/api/user/:userId/answers", async (req, res) => {
   try {
     const rows = await all(`SELECT question_id, is_correct, answer FROM answers WHERE user_id=$1`, [req.params.userId]);
@@ -473,7 +642,7 @@ app.get("/api/user/:userId/performance", async (req, res) => {
   }
 });
 
-/* ---------- KADEMELİ YARIŞ ---------- */
+/* ---------- KADEMELİ YARIŞ (mevcut) ---------- */
 app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -608,6 +777,7 @@ app.get("/api/admin/statistics", async (_req, res) => {
   } catch { res.status(500).json({ error: "İstatistik hatası!" }); }
 });
 
+// GENEL PUAN TABLOSU
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const period = req.query.period || "all";
@@ -648,6 +818,7 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
+// GENEL RANK
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -684,6 +855,7 @@ app.get("/api/user/:userId/rank", async (req, res) => {
   }
 });
 
+// KATEGORİ BAZLI PUAN TABLOSU
 app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
   try {
     const surveyId = req.params.surveyId;
@@ -742,115 +914,6 @@ app.get("/api/user/approved-surveys", async (_req, res) => {
 function filteredSurveysPush(arr, survey, count) {
   arr.push({ ...survey, question_count: count });
 }
-
-/* ---------- GÜNÜN YARIŞMASI ---------- */
-
-// Günlük seti başlat: Herkese aynı 128 soru (deterministik)
-app.get("/api/daily-contest/start", async (req, res) => {
-  try {
-    const userId = Number(req.query.user_id || 0);
-    if (!userId) return res.status(400).json({ error: "user_id gerekli" });
-
-    const size = Number(process.env.DAILY_CONTEST_SIZE) || 128;
-    const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()), 'YYYY-MM-DD') AS day`);
-    const day = row.day;
-    const seed = `${day}|${process.env.DAILY_CONTEST_SECRET || "felox-secret"}`;
-
-    const questions = await all(
-      `
-      SELECT q.id, q.question, q.point
-      FROM questions q
-      INNER JOIN surveys s ON s.id = q.survey_id
-      WHERE s.status='approved'
-      ORDER BY md5(q.id::text || $1)
-      LIMIT $2
-      `,
-      [seed, size]
-    );
-
-    res.json({ success: true, day, size, questions });
-  } catch (e) {
-    res.status(500).json({ error: "Günün yarışması başlatılamadı: " + e.message });
-  }
-});
-
-// Günlük yarışma puan tablosu: puan DESC, süre (harcanan sn) ASC
-app.get("/api/daily-contest/leaderboard", async (req, res) => {
-  try {
-    const dayParam = (req.query.day || "").slice(0, 10);
-    let day = dayParam;
-    if (!day) {
-      const r = await get(`SELECT to_char(timezone('Europe/Istanbul', now()), 'YYYY-MM-DD') AS day`);
-      day = r.day;
-    }
-
-    const rows = await all(
-      `
-      SELECT 
-        u.id, u.ad, u.soyad,
-        COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ),0)::int AS total_points,
-        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS spent_seconds
-      FROM users u
-      INNER JOIN answers a ON a.user_id = u.id
-      INNER JOIN questions q ON q.id = a.question_id
-      WHERE a.context='daily' AND a.contest_day = $1
-      GROUP BY u.id, u.ad, u.soyad
-      ORDER BY total_points DESC, spent_seconds ASC, u.id ASC
-      `,
-      [day]
-    );
-
-    // Rütbe: bugüne kadar kaç günde birinci olmuş
-    const wins = await all(
-      `
-      WITH day_scores AS (
-        SELECT a.contest_day, a.user_id,
-               COALESCE(SUM(
-                 CASE
-                   WHEN a.answer = 'bilmem' THEN 0
-                   WHEN a.is_correct = 1 THEN q.point
-                   WHEN a.is_correct = 0 THEN -q.point
-                   ELSE 0
-                 END
-               ),0) AS pts,
-               COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0) AS spent
-        FROM answers a
-        INNER JOIN questions q ON q.id = a.question_id
-        WHERE a.context='daily' AND a.contest_day IS NOT NULL
-        GROUP BY a.contest_day, a.user_id
-      ),
-      ranked AS (
-        SELECT contest_day, user_id, pts, spent,
-               RANK() OVER (PARTITION BY contest_day ORDER BY pts DESC, spent ASC, user_id ASC) AS rnk
-        FROM day_scores
-      )
-      SELECT user_id, COUNT(*)::int AS wins
-      FROM ranked
-      WHERE rnk=1
-      GROUP BY user_id
-      `
-    );
-    const winMap = {};
-    wins.forEach(w => { winMap[String(w.user_id)] = w.wins; });
-
-    const withRanks = rows.map((r, i) => ({
-      ...r,
-      rank: i + 1,
-      wins: winMap[String(r.id)] || 0,
-    }));
-
-    res.json({ success: true, day, leaderboard: withRanks });
-  } catch (e) {
-    res.status(500).json({ error: "Günlük leaderboard alınamadı: " + e.message });
-  }
-});
 
 /* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
