@@ -844,7 +844,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
             ELSE 0
           END
         ),0)::int AS total_points,
-        COALESCE(SUM(COALESCE(a.max_time_seconds,0) - COALESCE(a.time_left_seconds,0)),0)::int AS time_spent
+        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS time_spent
       FROM users u
       INNER JOIN answers a ON a.user_id = u.id
       INNER JOIN questions q ON q.id = a.question_id
@@ -929,7 +929,7 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
-// GENEL RANK
+// GENEL RANK — 2) Uyum düzeltmesi: sıfır puanlıları hariç tut, bulunamazsa rank:null
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -953,14 +953,22 @@ app.get("/api/user/:userId/rank", async (req, res) => {
       WHERE 1=1
         ${periodClause}
       GROUP BY u.id
+      HAVING COALESCE(SUM(
+        CASE
+          WHEN a.answer = 'bilmem' THEN 0
+          WHEN a.is_correct = 1 THEN q.point
+          WHEN a.is_correct = 0 THEN -q.point
+          ELSE 0
+        END
+      ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
       `
     );
 
     const idx = rows.findIndex(r => String(r.id) === String(userId));
-    const rank = idx === -1 ? null : idx + 1;            // <--- 0 yerine null
+    const rank = idx >= 0 ? (idx + 1) : null;
     const total_users = rows.length;
-    const user_points = rank ? rows[rank - 1].total_points : 0;
+    const user_points = idx >= 0 ? rows[idx].total_points : 0;
     res.json({ success: true, rank, total_users, user_points });
   } catch {
     res.status(500).json({ error: "Sıralama alınamadı" });
