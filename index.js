@@ -323,7 +323,7 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
 
-/* --------- CEVAP KAYDI: süre bilgisi + earned_seconds --------- */
+/* --------- CEVAP KAYDI --------- */
 async function insertAnswer({
   user_id, question_id, norm_answer, is_correct,
   maxSec, leftSec, earned, isDaily = false, dailyKey = null
@@ -606,7 +606,7 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 
-// Günün soru seti (deterministik ve herkes için aynı)
+// Günün soru seti
 async function dailyQuestionSet(dayKey, limit) {
   return await all(
     `
@@ -670,7 +670,6 @@ app.get("/api/daily/status", async (req, res) => {
       return res.json({ success: true, day_key: dayKey, finished: true, index: 0, size: 0, question: null });
     }
 
-    // Emniyet: idx üst sınırı aşmışsa bitir
     if (idx >= set.length) {
       await run(
         `UPDATE daily_sessions SET current_index=$1, finished=true, updated_at=timezone('Europe/Istanbul', now())
@@ -702,7 +701,7 @@ app.get("/api/daily/status", async (req, res) => {
   }
 });
 
-// Answer (E/H/B)
+// Answer
 app.post("/api/daily/answer", async (req, res) => {
   try {
     const { user_id, question_id, answer, time_left_seconds, max_time_seconds } = req.body;
@@ -748,7 +747,6 @@ app.post("/api/daily/answer", async (req, res) => {
       dailyKey: dayKey
     });
 
-    // ilerlet
     const nextIndex = session.current_index + 1;
     const isFinished = nextIndex >= set.length;
     await run(
@@ -770,7 +768,7 @@ app.post("/api/daily/answer", async (req, res) => {
   }
 });
 
-// Skip (Şimdilik bu kadar): mevcut soruyu bilmem say
+// Skip
 app.post("/api/daily/skip", async (req, res) => {
   try {
     const { user_id, question_id, time_left_seconds, max_time_seconds } = req.body;
@@ -826,7 +824,7 @@ app.post("/api/daily/skip", async (req, res) => {
   }
 });
 
-// Günlük Leaderboard (bugün)
+// Günlük Leaderboard (bugün)  — answered_count eklendi
 app.get("/api/daily/leaderboard", async (req, res) => {
   try {
     const dayKey = req.query.day || await getDayKey();
@@ -836,6 +834,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
         u.id,
         u.ad,
         u.soyad,
+        COUNT(a.*)::int AS answered_count,
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
@@ -851,6 +850,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
       WHERE a.is_daily = true
         AND a.daily_key = $1
       GROUP BY u.id, u.ad, u.soyad
+      HAVING COUNT(a.*) > 0
       ORDER BY total_points DESC, time_spent ASC, u.id ASC
       LIMIT 100
       `,
@@ -863,7 +863,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
   }
 });
 
-/* ---------- STATS & LEADERBOARDS (İstanbul TZ ile) ---------- */
+/* ---------- STATS & LEADERBOARDS ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
     const a = await get(`SELECT COUNT(*)::int AS count FROM users`);
@@ -929,7 +929,7 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
-// GENEL RANK — 2) Uyum düzeltmesi: sıfır puanlıları hariç tut, bulunamazsa rank:null
+// GENEL RANK — sıfır puanlıları hariç tut
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
