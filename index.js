@@ -162,6 +162,10 @@ async function init() {
     author TEXT
   )`);
 
+  // (İsteğe bağlı) Sorgu hızlandırıcı index'ler
+  await run(`CREATE INDEX IF NOT EXISTS idx_answers_daily ON answers (is_daily, daily_key, user_id)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_answers_user_q ON answers (user_id, question_id)`);
+
   console.log("PostgreSQL tablolar hazır");
 }
 init().catch(e => { console.error(e); process.exit(1); });
@@ -333,7 +337,7 @@ async function insertAnswer({
        (user_id, question_id, answer, is_correct, created_at,
         max_time_seconds, time_left_seconds, earned_seconds,
         is_daily, daily_key)
-     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now() ),
+     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),
              $5,$6,$7,$8,$9)`,
     [user_id, question_id, norm_answer, is_correct, maxSec, leftSec, earned, isDaily, dailyKey]
   );
@@ -826,7 +830,7 @@ app.post("/api/daily/skip", async (req, res) => {
   }
 });
 
-// Günlük Leaderboard (bugün) — sadece katılanlar + answered_count
+// Günlük Leaderboard (bugün)  << answered_count eklendi
 app.get("/api/daily/leaderboard", async (req, res) => {
   try {
     const dayKey = req.query.day || await getDayKey();
@@ -836,7 +840,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
         u.id,
         u.ad,
         u.soyad,
-        COUNT(*)::int AS answered_count,
+        COUNT(a.*)::int AS answered_count,
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
@@ -852,7 +856,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
       WHERE a.is_daily = true
         AND a.daily_key = $1
       GROUP BY u.id, u.ad, u.soyad
-      HAVING COUNT(*) > 0
+      HAVING COUNT(a.*) > 0
       ORDER BY total_points DESC, time_spent ASC, u.id ASC
       LIMIT 100
       `,
