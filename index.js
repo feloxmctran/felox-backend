@@ -42,7 +42,7 @@ async function get(sql, params = []) { const { rows } = await pool.query(sql, pa
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
 
 /* ---------- ENV (Günlük Yarışma) ---------- */
-const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
+const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "20", 10));
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
 
 /* ---------- HEALTH ---------- */
@@ -86,6 +86,13 @@ async function getDayKey() {
   const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()), 'YYYY-MM-DD') AS day`);
   return row?.day || new Date().toISOString().slice(0, 10);
 }
+
+/* === FEL0X: YESTERDAY KEY (ÖDÜL İÇİN) START === */
+async function getYesterdayKey() {
+  const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()) - interval '1 day', 'YYYY-MM-DD') AS day`);
+  return row?.day;
+}
+/* === FEL0X: YESTERDAY KEY END === */
 
 /* ---------- DB INIT (tablolar) ---------- */
 async function init() {
@@ -161,6 +168,36 @@ async function init() {
     text TEXT NOT NULL,
     author TEXT
   )`);
+
+  /* === FEL0X: BOOKS SCHEMA START === */
+  await run(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS books integer DEFAULT 0
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS book_awards (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      day_key TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      amount INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, day_key)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS book_spends (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
+      day_key TEXT,
+      amount INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  /* === FEL0X: BOOKS SCHEMA END === */
 
   // (İsteğe bağlı) Sorgu hızlandırıcı index'ler
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_daily ON answers (is_daily, daily_key, user_id)`);
@@ -337,8 +374,8 @@ async function insertAnswer({
        (user_id, question_id, answer, is_correct, created_at,
         max_time_seconds, time_left_seconds, earned_seconds,
         is_daily, daily_key)
-     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()),
-             $5,$6,$7,$8,$9)`,
+     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()'),
+             $5,$6,$7,$8,$9)`.replace("now()'", "now()"), // küçük string hack (format)
     [user_id, question_id, norm_answer, is_correct, maxSec, leftSec, earned, isDaily, dailyKey]
   );
 }
@@ -868,6 +905,105 @@ app.get("/api/daily/leaderboard", async (req, res) => {
     res.status(500).json({ error: "Günlük leaderboard alınamadı" });
   }
 });
+
+/* === FEL0X: BOOKS API START === */
+// Kullanıcının kitap sayısı
+app.get("/api/user/:userId/books", async (req, res) => {
+  try {
+    const row = await get(`SELECT COALESCE(books,0)::int AS books FROM users WHERE id=$1`, [req.params.userId]);
+    res.json({ success: true, books: row?.books || 0 });
+  } catch {
+    res.status(500).json({ error: "Kitap bilgisi alınamadı" });
+  }
+});
+
+// 1 kitap harca ve doğru cevabı dön
+app.post("/api/books/spend", async (req, res) => {
+  try {
+    const { user_id, question_id } = req.body || {};
+    if (!user_id || !question_id) return res.status(400).json({ error: "user_id ve question_id zorunludur." });
+
+    const q = await get(`SELECT correct_answer FROM questions WHERE id=$1`, [question_id]);
+    if (!q) return res.status(404).json({ error: "Soru bulunamadı" });
+
+    const dec = await get(
+      `UPDATE users SET books = COALESCE(books,0) - 1
+       WHERE id=$1 AND COALESCE(books,0) > 0
+       RETURNING COALESCE(books,0)::int AS books`,
+      [user_id]
+    );
+    if (!dec) return res.status(400).json({ error: "Yetersiz kitap." });
+
+    const dayKey = await getDayKey();
+    await run(`INSERT INTO book_spends (user_id, question_id, day_key, amount) VALUES ($1,$2,$3,1)`,
+      [user_id, question_id, dayKey]);
+
+    res.json({ success: true, remaining: dec.books, correct_answer: q.correct_answer });
+  } catch (e) {
+    res.status(500).json({ error: "Kitap kullanılamadı: " + e.message });
+  }
+});
+
+// Dünün kazananlarına ödül ver (idempotent)
+app.post("/api/daily/award-books", async (req, res) => {
+  try {
+    const targetDay = req.body?.day || await getYesterdayKey();
+    if (!targetDay) return res.status(400).json({ error: "day belirlenemedi" });
+
+    const winners = await all(
+      `
+      SELECT
+        u.id,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ),0)::int AS total_points,
+        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS time_spent
+      FROM users u
+      INNER JOIN answers a ON a.user_id = u.id
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.is_daily = true
+        AND a.daily_key = $1
+      GROUP BY u.id
+      HAVING COUNT(a.*) > 0
+      ORDER BY total_points DESC, time_spent ASC, u.id ASC
+      LIMIT 3
+      `,
+      [targetDay]
+    );
+
+    const prizes = [5, 3, 1]; // 1.,2.,3.
+    const awarded = [];
+
+    for (let i = 0; i < winners.length; i++) {
+      const u = winners[i];
+      const amount = prizes[i] || 0;
+      if (amount <= 0) continue;
+
+      const ins = await get(
+        `INSERT INTO book_awards (user_id, day_key, rank, amount)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (user_id, day_key) DO NOTHING
+         RETURNING 1 AS ok`,
+        [u.id, targetDay, i + 1, amount]
+      );
+
+      if (ins?.ok) {
+        await run(`UPDATE users SET books = COALESCE(books,0) + $1 WHERE id=$2`, [amount, u.id]);
+        awarded.push({ user_id: u.id, rank: i + 1, amount });
+      }
+    }
+
+    res.json({ success: true, day: targetDay, awarded });
+  } catch (e) {
+    res.status(500).json({ error: "Ödül verilemedi: " + e.message });
+  }
+});
+/* === FEL0X: BOOKS API END === */
 
 /* ---------- STATS & LEADERBOARDS (İstanbul TZ ile) ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
