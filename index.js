@@ -205,7 +205,16 @@ async function init() {
 
   console.log("PostgreSQL tablolar hazır");
 }
-init().catch(e => { console.error(e); process.exit(1); });
+init()
+  .then(() => {
+    console.log("PostgreSQL tablolar hazır");
+
+    // Ödül zamanlayıcısını başlat
+    awardSchedulerTick();                    // açılışta bir kez dene
+    setInterval(awardSchedulerTick, 5 * 60 * 1000); // sonra 5 dakikada bir kontrol et
+  })
+  .catch(e => { console.error(e); process.exit(1); });
+
 
 /* ---------- AUTH ---------- */
 app.post("/api/register", async (req, res) => {
@@ -1164,6 +1173,77 @@ app.get("/api/user/approved-surveys", async (_req, res) => {
     return res.json({ success: true, surveys: filtered });
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
+
+/* === FEL0X: DAILY AWARD SCHEDULER === */
+let lastAwardedFor = null;
+
+async function awardSchedulerTick() {
+  try {
+    const yKey = await getYesterdayKey();
+    if (!yKey) return;
+
+    // Aynı güne iki kez verme
+    if (lastAwardedFor === yKey) return;
+
+    // Düne zaten ödül verildiyse çık
+    const already = await get(`SELECT 1 FROM book_awards WHERE day_key=$1 LIMIT 1`, [yKey]);
+    if (already) { lastAwardedFor = yKey; return; }
+
+    // Dünün ilk 3'ünü hesapla (endpoint ile aynı mantık)
+    const winners = await all(
+      `
+      SELECT
+        u.id,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ),0)::int AS total_points,
+        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS time_spent
+      FROM users u
+      INNER JOIN answers a ON a.user_id = u.id
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.is_daily = true
+        AND a.daily_key = $1
+      GROUP BY u.id
+      HAVING COUNT(a.*) > 0
+      ORDER BY total_points DESC, time_spent ASC, u.id ASC
+      LIMIT 3
+      `,
+      [yKey]
+    );
+
+    const prizes = [5, 3, 1]; // 1., 2., 3.
+
+    for (let i = 0; i < winners.length; i++) {
+      const u = winners[i];
+      const amount = prizes[i] || 0;
+      if (amount <= 0) continue;
+
+      // idempotent: aynı güne ikinci kez yazmaz
+      const ins = await get(
+        `INSERT INTO book_awards (user_id, day_key, rank, amount)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (user_id, day_key) DO NOTHING
+         RETURNING 1 AS ok`,
+        [u.id, yKey, i + 1, amount]
+      );
+
+      if (ins?.ok) {
+        await run(`UPDATE users SET books = COALESCE(books,0) + $1 WHERE id=$2`, [amount, u.id]);
+        console.log("Ödül verildi:", yKey, "user", u.id, "rank", i + 1, "amount", amount);
+      }
+    }
+
+    lastAwardedFor = yKey;
+  } catch (e) {
+    console.error("awardSchedulerTick hata:", e.message);
+  }
+}
+
 
 /* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
