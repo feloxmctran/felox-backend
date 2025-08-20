@@ -169,6 +169,16 @@ async function init() {
     author TEXT
   )`);
 
+// Özel günler
+await run(`
+  CREATE TABLE IF NOT EXISTS impdays (
+    day_key TEXT PRIMARY KEY,           -- 'YYYY-MM-DD' (İstanbul günü)
+    daytitle TEXT NOT NULL,
+    description TEXT
+  )
+`);
+
+
   /* === FEL0X: BOOKS SCHEMA START === */
   await run(`
     ALTER TABLE users
@@ -914,6 +924,23 @@ app.get("/api/daily/leaderboard", async (req, res) => {
     res.status(500).json({ error: "Günlük leaderboard alınamadı" });
   }
 });
+
+// Bugünün (veya ?day=YYYY-MM-DD) özel gün kaydı
+app.get("/api/important-day", async (req, res) => {
+  try {
+    const dayKey = req.query.day || await getDayKey(); // Europe/Istanbul
+    const row = await get(
+      `SELECT day_key, daytitle, description FROM impdays WHERE day_key=$1`,
+      [dayKey]
+    );
+    return res.json({ success: true, day_key: dayKey, record: row || null });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Important day alınamadı" });
+  }
+});
+
+
 
 /* === FEL0X: BOOKS API START === */
 // Kullanıcının kitap sayısı
