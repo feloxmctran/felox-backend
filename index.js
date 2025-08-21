@@ -1066,6 +1066,86 @@ app.post("/api/daily/award-books", async (req, res) => {
 });
 /* === FEL0X: BOOKS API END === */
 
+
+/* ---------- SPEED TIER (Garantici/Tedbirli/Cesur/Âlim) ---------- */
+app.get("/api/user/:userId/speed-tier", async (req, res) => {
+  try {
+    const userId = Number(req.params.userId);
+
+    // Tüm kullanıcıların avg(earned_seconds) dağılımından çeyreklikler
+    const thr = await get(
+      `
+      WITH agg AS (
+        SELECT user_id, AVG(earned_seconds)::numeric AS avg_earned
+        FROM answers
+        WHERE earned_seconds IS NOT NULL
+          AND answer != 'bilmem'                -- yalnız denenen cevaplar
+        GROUP BY user_id
+      )
+      SELECT
+        percentile_disc(0.25) WITHIN GROUP (ORDER BY avg_earned) AS p25,
+        percentile_disc(0.50) WITHIN GROUP (ORDER BY avg_earned) AS p50,
+        percentile_disc(0.75) WITHIN GROUP (ORDER BY avg_earned) AS p75
+      FROM agg
+      `
+    );
+
+    // Kullanıcının ortalamaları
+    const me = await get(
+      `
+      SELECT
+        ROUND(AVG(earned_seconds)::numeric, 2) AS avg_earned_seconds,
+        ROUND(AVG(GREATEST(max_time_seconds,0) - GREATEST(time_left_seconds,0))::numeric, 2)
+          AS avg_spent_seconds,
+        COUNT(*)::int AS answers_count
+      FROM answers
+      WHERE user_id = $1
+        AND earned_seconds IS NOT NULL
+        AND max_time_seconds IS NOT NULL
+        AND time_left_seconds IS NOT NULL
+        AND answer != 'bilmem'
+      `,
+      [userId]
+    );
+
+    if (!me || !me.answers_count) {
+      return res.json({
+        success: true,
+        tier: null,
+        avg_earned_seconds: null,
+        avg_spent_seconds: null,
+        thresholds: thr || null,
+        answers_count: 0,
+      });
+    }
+
+    const avg = Number(me.avg_earned_seconds);
+    // Eğer hiç global veri yoksa (yeni sistem), makul fallback eşikleri kullan
+    const p25 = Number(thr?.p25 ?? 6);
+    const p50 = Number(thr?.p50 ?? 10);
+    const p75 = Number(thr?.p75 ?? 16);
+
+    let tier = "garantici";
+    if (avg >= p75)       tier = "alim";
+    else if (avg >= p50)  tier = "cesur";
+    else if (avg >= p25)  tier = "tedbirli";
+    else                  tier = "garantici";
+
+    return res.json({
+      success: true,
+      tier,
+      avg_earned_seconds: avg,
+      avg_spent_seconds: Number(me.avg_spent_seconds),
+      thresholds: { p25, p50, p75 },
+      answers_count: me.answers_count
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Hız kademesi hesaplanamadı: " + e.message });
+  }
+});
+
+
+
 /* ---------- STATS & LEADERBOARDS (İstanbul TZ ile) ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
