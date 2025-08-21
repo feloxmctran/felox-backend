@@ -42,7 +42,7 @@ async function get(sql, params = []) { const { rows } = await pool.query(sql, pa
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
 
 /* ---------- ENV (Günlük Yarışma) ---------- */
-const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "20", 10));
+const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
 
 /* ---------- HEALTH ---------- */
@@ -666,20 +666,45 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 
-// Günün soru seti (deterministik ve herkes için aynı)
+// Günün soru seti: önce qtype=2, yetmezse qtype=1 ile doldur
 async function dailyQuestionSet(dayKey, limit) {
-  return await all(
+  const size = Math.max(1, limit);
+
+  // 1) Önce qtype=2
+  const preferred = await all(
     `
     SELECT q.id, q.question, q.point
     FROM questions q
-    INNER JOIN surveys s ON s.id = q.survey_id
+    JOIN surveys s ON s.id = q.survey_id
     WHERE s.status='approved'
+      AND COALESCE(q.qtype,1) = 2
     ORDER BY md5($1 || '-' || $2 || '-' || q.id::text)
     LIMIT $3
     `,
-    [DAILY_CONTEST_SECRET, dayKey, Math.max(1, limit)]
+    [DAILY_CONTEST_SECRET, dayKey, size]
   );
+
+  const need = size - preferred.length;
+  if (need <= 0) return preferred.slice(0, size);
+
+  // 2) Kalanı qtype=1 (daha önce seçtikler hariç)
+  const fillers = await all(
+    `
+    SELECT q.id, q.question, q.point
+    FROM questions q
+    JOIN surveys s ON s.id = q.survey_id
+    WHERE s.status='approved'
+      AND COALESCE(q.qtype,1) = 1
+      AND q.id <> ALL($4::int[])
+    ORDER BY md5($1 || '-' || $2 || '-' || q.id::text)
+    LIMIT $3
+    `,
+    [DAILY_CONTEST_SECRET, dayKey, need, preferred.map(r => r.id)]
+  );
+
+  return preferred.concat(fillers);
 }
+
 
 // Oturum getir/oluştur
 async function getOrCreateDailySession(userId, dayKey) {
