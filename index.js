@@ -213,6 +213,11 @@ await run(`
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_daily ON answers (is_daily, daily_key, user_id)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_user_q ON answers (user_id, question_id)`);
 
+  // book_awards için (champions sorgusunu hızlandırır)
+await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
+await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
+
+
   console.log("PostgreSQL tablolar hazır");
 }
 init()
@@ -949,6 +954,46 @@ app.get("/api/daily/leaderboard", async (req, res) => {
     res.status(500).json({ error: "Günlük leaderboard alınamadı" });
   }
 });
+
+// Günün Yarışması Birincileri (kaç kez 1. olmuş?)
+// book_awards tarafındaki rank=1 kayıtlarından okunur
+app.get("/api/daily/champions", async (req, res) => {
+  try {
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit || "100", 10)));
+    const since = req.query.since || null; // opsiyonel: "YYYY-MM-DD" ve sonrası
+
+    const params = [];
+    let where = `b.rank = 1`;
+    if (since) { where += ` AND b.day_key >= $1`; params.push(since); }
+
+    const rows = await all(
+      `
+      SELECT
+        u.id,
+        u.ad,
+        u.soyad,
+        COUNT(*)::int AS wins,
+        COUNT(*)::int AS first_wins,   -- UI eski ad bekliyorsa
+        MIN(b.day_key) AS first_win_day,
+        MAX(b.day_key) AS last_win_day
+      FROM book_awards b
+      JOIN users u ON u.id = b.user_id
+      WHERE ${where}
+      GROUP BY u.id, u.ad, u.soyad
+      ORDER BY wins DESC, last_win_day DESC, u.id ASC
+      LIMIT $${params.length + 1}
+      `,
+      [...params, limit]
+    );
+
+    res.json({ success: true, champions: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Günün birincileri alınamadı: " + e.message });
+  }
+});
+
+
 
 // Bugünün (veya ?day=YYYY-MM-DD) özel gün kaydı
 app.get("/api/important-day", async (req, res) => {
