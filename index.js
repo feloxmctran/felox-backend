@@ -959,7 +959,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
 // book_awards tarafındaki rank=1 kayıtlarından okunur
 app.get("/api/daily/champions", async (req, res) => {
   try {
-    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit || "100", 10)));
+    const limit = 10;
     const since = req.query.since || null; // opsiyonel: "YYYY-MM-DD" ve sonrası
 
     const params = [];
