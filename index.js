@@ -804,29 +804,25 @@ app.post("/api/daily/answer", async (req, res) => {
     }
 
     const dayKey = await getDayKey();
+    const size = DAILY_CONTEST_SIZE;
+
     const session = await getOrCreateDailySession(user_id, dayKey);
 
-    // Set'i garanti et (gerekirse üretir) ve uzunluğu al
-    const ids = await getOrCreateDailySetIds(dayKey, DAILY_CONTEST_SIZE);
+    // Set’i tablodan oku
+    const ids = await getOrCreateDailySetIds(dayKey, size);
 
-    // Bitiş kontrolü: boyutu tablodan (ids.length) al
+    // Bitmiş mi?
     if (session.finished || session.current_index >= ids.length) {
       return res.json({ success: true, finished: true, message: "Bugünün yarışması tamamlandı" });
     }
 
-    // Senkron kontrol: tablodaki beklenen soru = current_index + 1 (pos 1-bazlı)
-    const expected = await get(
-      `SELECT question_id
-         FROM daily_contest_questions
-        WHERE (day_key = $1 OR contest_date = $2::date)
-          AND COALESCE(pos, seq + 1) = $3`,
-      [dayKey, dayKey, session.current_index + 1]
-    );
-    if (!expected || Number(expected.question_id) !== Number(question_id)) {
+    // Soru senkron kontrolü
+    const expectedId = ids[session.current_index];
+    if (!expectedId || Number(expectedId) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
     }
 
-    // Cevabı değerlendir
+    // Soruyu çek (doğru cevap/puan için)
     const q = await get(`SELECT correct_answer, point FROM questions WHERE id=$1`, [question_id]);
     if (!q) return res.status(400).json({ error: "Soru bulunamadı!" });
 
@@ -852,10 +848,9 @@ app.post("/api/daily/answer", async (req, res) => {
       dailyKey: dayKey
     });
 
-    // İlerlet ve bitişi set uzunluğuna göre hesapla
+    // ilerlet
     const nextIndex = session.current_index + 1;
     const isFinished = nextIndex >= ids.length;
-
     await run(
       `UPDATE daily_sessions
          SET current_index=$1, finished=$2, updated_at=timezone('Europe/Istanbul', now())
@@ -871,7 +866,7 @@ app.post("/api/daily/answer", async (req, res) => {
 });
 
 
-// Skip (Şimdilik bu kadar): mevcut soruyu bilmem say
+// Skip (mevcut soruyu bilmem say)
 app.post("/api/daily/skip", async (req, res) => {
   try {
     const { user_id, question_id, time_left_seconds, max_time_seconds } = req.body;
@@ -880,25 +875,21 @@ app.post("/api/daily/skip", async (req, res) => {
     }
 
     const dayKey = await getDayKey();
+    const size = DAILY_CONTEST_SIZE;
+
     const session = await getOrCreateDailySession(user_id, dayKey);
 
-    // Set'i garanti et (gerekirse üretir) ve uzunluğu al
-    const ids = await getOrCreateDailySetIds(dayKey, DAILY_CONTEST_SIZE);
+    // Set’i tablodan oku
+    const ids = await getOrCreateDailySetIds(dayKey, size);
 
-    // Bitiş kontrolü
+    // Bitmiş mi?
     if (session.finished || session.current_index >= ids.length) {
       return res.json({ success: true, finished: true });
     }
 
-    // Senkron kontrol
-    const expected = await get(
-      `SELECT question_id
-         FROM daily_contest_questions
-        WHERE (day_key = $1 OR contest_date = $2::date)
-          AND COALESCE(pos, seq + 1) = $3`,
-      [dayKey, dayKey, session.current_index + 1]
-    );
-    if (!expected || Number(expected.question_id) !== Number(question_id)) {
+    // Soru senkron kontrolü
+    const expectedId = ids[session.current_index];
+    if (!expectedId || Number(expectedId) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
     }
 
@@ -923,7 +914,6 @@ app.post("/api/daily/skip", async (req, res) => {
 
     const nextIndex = session.current_index + 1;
     const isFinished = nextIndex >= ids.length;
-
     await run(
       `UPDATE daily_sessions
          SET current_index=$1, finished=$2, updated_at=timezone('Europe/Istanbul', now())
@@ -937,6 +927,7 @@ app.post("/api/daily/skip", async (req, res) => {
     res.status(500).json({ error: "Günlük skip kaydedilemedi" });
   }
 });
+
 
 
 // Günlük Leaderboard (bugün)  << answered_count eklendi
