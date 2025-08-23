@@ -671,44 +671,75 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 
-// Günün soru seti: önce qtype=2, yetmezse qtype=1 ile doldur
-async function dailyQuestionSet(dayKey, limit) {
-  const size = Math.max(1, limit);
+// Günün setini tabloya yazıp dondurur; yoksa deterministik üretir
+async function getOrCreateDailySetIds(dayKey, size) {
+  // 1) Varsa oku (pos varsa onu, yoksa seq+1 sıralaması)
+  const existing = await all(
+    `SELECT question_id
+       FROM daily_contest_questions
+      WHERE (day_key = $1 OR contest_date = $2::date)
+      ORDER BY COALESCE(pos, seq + 1) ASC`,
+    [dayKey, dayKey]
+  );
+  if (existing.length > 0) return existing.map(r => r.question_id);
 
-  // 1) Önce qtype=2
+  // 2) Yoksa deterministik üret (qtype=2 öncelikli, sonra qtype=1 doldur)
   const preferred = await all(
     `
-    SELECT q.id, q.question, q.point
-    FROM questions q
-    JOIN surveys s ON s.id = q.survey_id
-    WHERE s.status='approved'
-      AND COALESCE(q.qtype,1) = 2
-    ORDER BY md5($1 || '-' || $2 || '-' || q.id::text)
-    LIMIT $3
+    SELECT q.id
+      FROM questions q
+      JOIN surveys s ON s.id = q.survey_id
+     WHERE s.status='approved'
+       AND COALESCE(q.qtype,1) = 2
+     ORDER BY md5($1 || '-' || $2 || '-' || q.id::text)
+     LIMIT $3
     `,
     [DAILY_CONTEST_SECRET, dayKey, size]
   );
-
   const need = size - preferred.length;
-  if (need <= 0) return preferred.slice(0, size);
 
-  // 2) Kalanı qtype=1 (daha önce seçtikler hariç)
-  const fillers = await all(
+  const fillers = need > 0 ? await all(
     `
-    SELECT q.id, q.question, q.point
-    FROM questions q
-    JOIN surveys s ON s.id = q.survey_id
-    WHERE s.status='approved'
-      AND COALESCE(q.qtype,1) = 1
-      AND q.id <> ALL($4::int[])
-    ORDER BY md5($1 || '-' || $2 || '-' || q.id::text)
-    LIMIT $3
+    SELECT q.id
+      FROM questions q
+      JOIN surveys s ON s.id = q.survey_id
+     WHERE s.status='approved'
+       AND COALESCE(q.qtype,1) = 1
+       AND q.id <> ALL($4::int[])
+     ORDER BY md5($1 || '-' || $2 || '-' || q.id::text)
+     LIMIT $3
     `,
     [DAILY_CONTEST_SECRET, dayKey, need, preferred.map(r => r.id)]
-  );
+  ) : [];
 
-  return preferred.concat(fillers);
+  const ids = preferred.concat(fillers).map(r => r.id).slice(0, size);
+
+  // 3) Tabloya yaz (PK/unique yoksa da çalışsın diye WHERE NOT EXISTS kullandım)
+  for (let i = 0; i < ids.length; i++) {
+    await run(
+      `
+      INSERT INTO daily_contest_questions (day_key, contest_date, pos, seq, question_id)
+      SELECT $1::text, $2::date, $3::int, $4::int, $5::int
+      WHERE NOT EXISTS (
+        SELECT 1 FROM daily_contest_questions
+         WHERE (day_key = $1 OR contest_date = $2::date)
+           AND COALESCE(pos, seq + 1) = $3
+      )
+      `,
+      [dayKey, dayKey, i + 1, i, ids[i]] // pos = 1-bazlı, seq = 0-bazlı
+    );
+  }
+
+  const finalRows = await all(
+    `SELECT question_id
+       FROM daily_contest_questions
+      WHERE (day_key = $1 OR contest_date = $2::date)
+      ORDER BY COALESCE(pos, seq + 1) ASC`,
+    [dayKey, dayKey]
+  );
+  return finalRows.map(r => r.question_id);
 }
+
 
 
 // Oturum getir/oluştur
@@ -742,55 +773,27 @@ app.get("/api/daily/status", async (req, res) => {
 
     const session = await getOrCreateDailySession(user_id, dayKey);
     let idx = Math.max(0, Number(session.current_index || 0));
-    const finished = !!session.finished || idx >= size;
+
+    const ids = await getOrCreateDailySetIds(dayKey, size);
+    const finished = !!session.finished || idx >= ids.length;
 
     if (finished) {
       return res.json({
-        success: true,
-        day_key: dayKey,
-        finished: true,
-        index: Math.min(idx, size),
-        size,
-        question: null,
+        success: true, day_key: dayKey, finished: true,
+        index: Math.min(idx, ids.length), size: ids.length, question: null
       });
     }
 
-    const set = await dailyQuestionSet(dayKey, size);
-    if (!set || set.length === 0) {
-      return res.json({ success: true, day_key: dayKey, finished: true, index: 0, size: 0, question: null });
-    }
+    const q = await get(`SELECT id, question, point FROM questions WHERE id=$1`, [ids[idx]]);
+    if (!q) return res.status(500).json({ error: "Soru setinde geçersiz id" });
 
-    // Emniyet: idx üst sınırı aşmışsa bitir
-    if (idx >= set.length) {
-      await run(
-        `UPDATE daily_sessions SET current_index=$1, finished=true, updated_at=timezone('Europe/Istanbul', now())
-         WHERE id=$2`,
-        [set.length, session.id]
-      );
-      return res.json({
-        success: true,
-        day_key: dayKey,
-        finished: true,
-        index: set.length,
-        size: set.length,
-        question: null,
-      });
-    }
-
-    const q = set[idx];
-    res.json({
-      success: true,
-      day_key: dayKey,
-      finished: false,
-      index: idx,
-      size: set.length,
-      question: q,
-    });
+    res.json({ success: true, day_key: dayKey, finished: false, index: idx, size: ids.length, question: q });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Günlük durum alınamadı" });
   }
 });
+
 
 // Answer (E/H/B)
 app.post("/api/daily/answer", async (req, res) => {
@@ -799,20 +802,31 @@ app.post("/api/daily/answer", async (req, res) => {
     if (!user_id || !question_id) {
       return res.status(400).json({ error: "user_id ve question_id zorunludur." });
     }
-    const dayKey = await getDayKey();
-    const size = DAILY_CONTEST_SIZE;
 
+    const dayKey = await getDayKey();
     const session = await getOrCreateDailySession(user_id, dayKey);
-    if (session.finished || session.current_index >= size) {
+
+    // Set'i garanti et (gerekirse üretir) ve uzunluğu al
+    const ids = await getOrCreateDailySetIds(dayKey, DAILY_CONTEST_SIZE);
+
+    // Bitiş kontrolü: boyutu tablodan (ids.length) al
+    if (session.finished || session.current_index >= ids.length) {
       return res.json({ success: true, finished: true, message: "Bugünün yarışması tamamlandı" });
     }
 
-    const set = await dailyQuestionSet(dayKey, size);
-    const expected = set[session.current_index];
-    if (!expected || Number(expected.id) !== Number(question_id)) {
+    // Senkron kontrol: tablodaki beklenen soru = current_index + 1 (pos 1-bazlı)
+    const expected = await get(
+      `SELECT question_id
+         FROM daily_contest_questions
+        WHERE (day_key = $1 OR contest_date = $2::date)
+          AND COALESCE(pos, seq + 1) = $3`,
+      [dayKey, dayKey, session.current_index + 1]
+    );
+    if (!expected || Number(expected.question_id) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
     }
 
+    // Cevabı değerlendir
     const q = await get(`SELECT correct_answer, point FROM questions WHERE id=$1`, [question_id]);
     if (!q) return res.status(400).json({ error: "Soru bulunamadı!" });
 
@@ -838,9 +852,10 @@ app.post("/api/daily/answer", async (req, res) => {
       dailyKey: dayKey
     });
 
-    // ilerlet
+    // İlerlet ve bitişi set uzunluğuna göre hesapla
     const nextIndex = session.current_index + 1;
-    const isFinished = nextIndex >= set.length;
+    const isFinished = nextIndex >= ids.length;
+
     await run(
       `UPDATE daily_sessions
          SET current_index=$1, finished=$2, updated_at=timezone('Europe/Istanbul', now())
@@ -848,17 +863,13 @@ app.post("/api/daily/answer", async (req, res) => {
       [nextIndex, isFinished, session.id]
     );
 
-    res.json({
-      success: true,
-      is_correct,
-      index: nextIndex,
-      finished: isFinished
-    });
+    res.json({ success: true, is_correct, index: nextIndex, finished: isFinished });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Günlük cevap kaydedilemedi" });
   }
 });
+
 
 // Skip (Şimdilik bu kadar): mevcut soruyu bilmem say
 app.post("/api/daily/skip", async (req, res) => {
@@ -867,17 +878,27 @@ app.post("/api/daily/skip", async (req, res) => {
     if (!user_id || !question_id) {
       return res.status(400).json({ error: "user_id ve question_id zorunludur." });
     }
-    const dayKey = await getDayKey();
-    const size = DAILY_CONTEST_SIZE;
 
+    const dayKey = await getDayKey();
     const session = await getOrCreateDailySession(user_id, dayKey);
-    if (session.finished || session.current_index >= size) {
+
+    // Set'i garanti et (gerekirse üretir) ve uzunluğu al
+    const ids = await getOrCreateDailySetIds(dayKey, DAILY_CONTEST_SIZE);
+
+    // Bitiş kontrolü
+    if (session.finished || session.current_index >= ids.length) {
       return res.json({ success: true, finished: true });
     }
 
-    const set = await dailyQuestionSet(dayKey, size);
-    const expected = set[session.current_index];
-    if (!expected || Number(expected.id) !== Number(question_id)) {
+    // Senkron kontrol
+    const expected = await get(
+      `SELECT question_id
+         FROM daily_contest_questions
+        WHERE (day_key = $1 OR contest_date = $2::date)
+          AND COALESCE(pos, seq + 1) = $3`,
+      [dayKey, dayKey, session.current_index + 1]
+    );
+    if (!expected || Number(expected.question_id) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
     }
 
@@ -901,7 +922,8 @@ app.post("/api/daily/skip", async (req, res) => {
     });
 
     const nextIndex = session.current_index + 1;
-    const isFinished = nextIndex >= set.length;
+    const isFinished = nextIndex >= ids.length;
+
     await run(
       `UPDATE daily_sessions
          SET current_index=$1, finished=$2, updated_at=timezone('Europe/Istanbul', now())
@@ -915,6 +937,7 @@ app.post("/api/daily/skip", async (req, res) => {
     res.status(500).json({ error: "Günlük skip kaydedilemedi" });
   }
 });
+
 
 // Günlük Leaderboard (bugün)  << answered_count eklendi
 app.get("/api/daily/leaderboard", async (req, res) => {
