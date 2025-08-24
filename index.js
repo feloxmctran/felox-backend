@@ -87,12 +87,11 @@ async function getDayKey() {
   return row?.day || new Date().toISOString().slice(0, 10);
 }
 
-/* === FEL0X: YESTERDAY KEY (ÖDÜL İÇİN) START === */
+/* === YESTERDAY KEY === */
 async function getYesterdayKey() {
   const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()) - interval '1 day', 'YYYY-MM-DD') AS day`);
   return row?.day;
 }
-/* === FEL0X: YESTERDAY KEY END === */
 
 /* ---------- DB INIT (tablolar) ---------- */
 async function init() {
@@ -108,6 +107,7 @@ async function init() {
     password TEXT,
     role TEXT
   )`);
+
   await run(`CREATE TABLE IF NOT EXISTS surveys (
     id SERIAL PRIMARY KEY,
     editor_id INTEGER REFERENCES users(id),
@@ -117,6 +117,7 @@ async function init() {
     category TEXT,
     status TEXT DEFAULT 'pending'
   )`);
+
   await run(`CREATE TABLE IF NOT EXISTS questions (
     id SERIAL PRIMARY KEY,
     survey_id INTEGER REFERENCES surveys(id) ON DELETE CASCADE,
@@ -124,6 +125,13 @@ async function init() {
     correct_answer TEXT,
     point INTEGER DEFAULT 1
   )`);
+
+  // günlük set tercihleri için
+  await run(`
+    ALTER TABLE questions
+    ADD COLUMN IF NOT EXISTS qtype integer DEFAULT 1
+  `);
+
   await run(`CREATE TABLE IF NOT EXISTS answers (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -138,7 +146,6 @@ async function init() {
     daily_key text
   )`);
 
-  // Güvenli şekilde ALTER (eski şemalardan gelenler için)
   await run(`
     ALTER TABLE answers
       ADD COLUMN IF NOT EXISTS max_time_seconds integer,
@@ -148,7 +155,18 @@ async function init() {
       ADD COLUMN IF NOT EXISTS daily_key text
   `);
 
-  // Günlük yarışma oturumları
+  await run(`
+    CREATE TABLE IF NOT EXISTS daily_contest_questions (
+      day_key     TEXT NOT NULL,
+      contest_date DATE,
+      pos         INTEGER,
+      seq         INTEGER,
+      question_id INTEGER REFERENCES questions(id) ON DELETE CASCADE,
+      PRIMARY KEY (day_key, pos)
+    )
+  `);
+  await run(`CREATE INDEX IF NOT EXISTS idx_dcq_day ON daily_contest_questions (day_key)`);
+
   await run(`
     CREATE TABLE IF NOT EXISTS daily_sessions (
       id SERIAL PRIMARY KEY,
@@ -162,24 +180,30 @@ async function init() {
     )
   `);
 
-  // QUOTES tablosu
+  await run(`
+    CREATE TABLE IF NOT EXISTS daily_finisher_awards (
+      user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      day_key   TEXT NOT NULL,
+      amount    INTEGER NOT NULL DEFAULT 2,
+      created_at TIMESTAMP DEFAULT timezone('Europe/Istanbul', now()),
+      PRIMARY KEY (user_id, day_key)
+    )
+  `);
+
   await run(`CREATE TABLE IF NOT EXISTS quotes (
     id SERIAL PRIMARY KEY,
     text TEXT NOT NULL,
     author TEXT
   )`);
 
-// Özel günler
-await run(`
-  CREATE TABLE IF NOT EXISTS impdays (
-    day_key TEXT PRIMARY KEY,           -- 'YYYY-MM-DD' (İstanbul günü)
-    daytitle TEXT NOT NULL,
-    description TEXT
-  )
-`);
+  await run(`
+    CREATE TABLE IF NOT EXISTS impdays (
+      day_key TEXT PRIMARY KEY,
+      daytitle TEXT NOT NULL,
+      description TEXT
+    )
+  `);
 
-
-  /* === FEL0X: BOOKS SCHEMA START === */
   await run(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS books integer DEFAULT 0
@@ -207,29 +231,21 @@ await run(`
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
-  /* === FEL0X: BOOKS SCHEMA END === */
 
-  // (İsteğe bağlı) Sorgu hızlandırıcı index'ler
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_daily ON answers (is_daily, daily_key, user_id)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_user_q ON answers (user_id, question_id)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
 
-  // book_awards için (champions sorgusunu hızlandırır)
-await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
-await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
+  
 
-
-  console.log("PostgreSQL tablolar hazır");
-}
 init()
   .then(() => {
     console.log("PostgreSQL tablolar hazır");
-
-    // Ödül zamanlayıcısını başlat
-    awardSchedulerTick();                    // açılışta bir kez dene
-    setInterval(awardSchedulerTick, 5 * 60 * 1000); // sonra 5 dakikada bir kontrol et
+    awardSchedulerTick();
+    setInterval(awardSchedulerTick, 5 * 60 * 1000);
   })
   .catch(e => { console.error(e); process.exit(1); });
-
 
 /* ---------- AUTH ---------- */
 app.post("/api/register", async (req, res) => {
@@ -388,20 +404,19 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
 
-/* --------- CEVAP KAYDI: süre bilgisi + earned_seconds --------- */
+/* --------- CEVAP KAYDI ---------- */
 async function insertAnswer({
   user_id, question_id, norm_answer, is_correct,
   maxSec, leftSec, earned, isDaily = false, dailyKey = null
 }) {
-  await run(
-    `INSERT INTO answers
-       (user_id, question_id, answer, is_correct, created_at,
-        max_time_seconds, time_left_seconds, earned_seconds,
-        is_daily, daily_key)
-     VALUES ($1,$2,$3,$4,timezone('Europe/Istanbul', now()'),
-             $5,$6,$7,$8,$9)`.replace("now()'", "now()"), // küçük string hack (format)
-    [user_id, question_id, norm_answer, is_correct, maxSec, leftSec, earned, isDaily, dailyKey]
-  );
+  await run(`
+    INSERT INTO answers
+      (user_id, question_id, answer, is_correct, created_at,
+       max_time_seconds, time_left_seconds, earned_seconds,
+       is_daily, daily_key)
+    VALUES ($1,$2,$3,$4, timezone('Europe/Istanbul', now()),
+            $5,$6,$7,$8,$9)
+  `, [user_id, question_id, norm_answer, is_correct, maxSec, leftSec, earned, isDaily, dailyKey]);
 }
 
 app.post("/api/answers", async (req, res) => {
@@ -670,10 +685,7 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
 });
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
-
-// Günün setini tabloya yazıp dondurur; yoksa deterministik üretir
 async function getOrCreateDailySetIds(dayKey, size) {
-  // 1) Varsa oku (pos varsa onu, yoksa seq+1 sıralaması)
   const existing = await all(
     `SELECT question_id
        FROM daily_contest_questions
@@ -683,7 +695,6 @@ async function getOrCreateDailySetIds(dayKey, size) {
   );
   if (existing.length > 0) return existing.map(r => r.question_id);
 
-  // 2) Yoksa deterministik üret (qtype=2 öncelikli, sonra qtype=1 doldur)
   const preferred = await all(
     `
     SELECT q.id
@@ -714,7 +725,6 @@ async function getOrCreateDailySetIds(dayKey, size) {
 
   const ids = preferred.concat(fillers).map(r => r.id).slice(0, size);
 
-  // 3) Tabloya yaz (PK/unique yoksa da çalışsın diye WHERE NOT EXISTS kullandım)
   for (let i = 0; i < ids.length; i++) {
     await run(
       `
@@ -726,7 +736,7 @@ async function getOrCreateDailySetIds(dayKey, size) {
            AND COALESCE(pos, seq + 1) = $3
       )
       `,
-      [dayKey, dayKey, i + 1, i, ids[i]] // pos = 1-bazlı, seq = 0-bazlı
+      [dayKey, dayKey, i + 1, i, ids[i]]
     );
   }
 
@@ -740,9 +750,6 @@ async function getOrCreateDailySetIds(dayKey, size) {
   return finalRows.map(r => r.question_id);
 }
 
-
-
-// Oturum getir/oluştur
 async function getOrCreateDailySession(userId, dayKey) {
   let s = await get(
     `SELECT * FROM daily_sessions WHERE user_id=$1 AND day_key=$2`,
@@ -762,7 +769,6 @@ async function getOrCreateDailySession(userId, dayKey) {
   return s;
 }
 
-// Status: index, soru, bitiş
 app.get("/api/daily/status", async (req, res) => {
   try {
     const user_id = Number(req.query.user_id);
@@ -794,8 +800,6 @@ app.get("/api/daily/status", async (req, res) => {
   }
 });
 
-
-// Answer (E/H/B)
 app.post("/api/daily/answer", async (req, res) => {
   try {
     const { user_id, question_id, answer, time_left_seconds, max_time_seconds } = req.body;
@@ -805,25 +809,19 @@ app.post("/api/daily/answer", async (req, res) => {
 
     const dayKey = await getDayKey();
     const size = DAILY_CONTEST_SIZE;
-
     const session = await getOrCreateDailySession(user_id, dayKey);
-
-    // Set’i tablodan oku
     const ids = await getOrCreateDailySetIds(dayKey, size);
 
-    // Bitmiş mi?
     if (session.finished || session.current_index >= ids.length) {
       return res.json({ success: true, finished: true, message: "Bugünün yarışması tamamlandı" });
     }
 
-    // Soru senkron kontrolü
     const expectedId = ids[session.current_index];
     if (!expectedId || Number(expectedId) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
     }
 
-    // Soruyu çek (doğru cevap/puan için)
-    const q = await get(`SELECT correct_answer, point FROM questions WHERE id=$1`, [question_id]);
+    const q = await get(`SELECT correct_answer FROM questions WHERE id=$1`, [question_id]);
     if (!q) return res.status(400).json({ error: "Soru bulunamadı!" });
 
     const norm = normalizeAnswer(answer);
@@ -848,7 +846,6 @@ app.post("/api/daily/answer", async (req, res) => {
       dailyKey: dayKey
     });
 
-    // ilerlet
     const nextIndex = session.current_index + 1;
     const isFinished = nextIndex >= ids.length;
     await run(
@@ -858,15 +855,28 @@ app.post("/api/daily/answer", async (req, res) => {
       [nextIndex, isFinished, session.id]
     );
 
-    res.json({ success: true, is_correct, index: nextIndex, finished: isFinished });
+    let awarded_books = 0;
+    if (isFinished) {
+      const ins = await get(`
+        INSERT INTO daily_finisher_awards (user_id, day_key, amount)
+        VALUES ($1, $2, 2)
+        ON CONFLICT (user_id, day_key) DO NOTHING
+        RETURNING 1 AS ok
+      `, [user_id, dayKey]);
+
+      if (ins?.ok) {
+        await run(`UPDATE users SET books = COALESCE(books,0) + 2 WHERE id=$1`, [user_id]);
+        awarded_books = 2;
+      }
+    }
+
+    return res.json({ success: true, is_correct, index: nextIndex, finished: isFinished, awarded_books });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Günlük cevap kaydedilemedi" });
   }
 });
 
-
-// Skip (mevcut soruyu bilmem say)
 app.post("/api/daily/skip", async (req, res) => {
   try {
     const { user_id, question_id, time_left_seconds, max_time_seconds } = req.body;
@@ -876,18 +886,13 @@ app.post("/api/daily/skip", async (req, res) => {
 
     const dayKey = await getDayKey();
     const size = DAILY_CONTEST_SIZE;
-
     const session = await getOrCreateDailySession(user_id, dayKey);
-
-    // Set’i tablodan oku
     const ids = await getOrCreateDailySetIds(dayKey, size);
 
-    // Bitmiş mi?
     if (session.finished || session.current_index >= ids.length) {
       return res.json({ success: true, finished: true });
     }
 
-    // Soru senkron kontrolü
     const expectedId = ids[session.current_index];
     if (!expectedId || Number(expectedId) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
@@ -921,16 +926,29 @@ app.post("/api/daily/skip", async (req, res) => {
       [nextIndex, isFinished, session.id]
     );
 
-    res.json({ success: true, index: nextIndex, finished: isFinished });
+    let awarded_books = 0;
+    if (isFinished) {
+      const ins = await get(`
+        INSERT INTO daily_finisher_awards (user_id, day_key, amount)
+        VALUES ($1, $2, 2)
+        ON CONFLICT (user_id, day_key) DO NOTHING
+        RETURNING 1 AS ok
+      `, [user_id, dayKey]);
+
+      if (ins?.ok) {
+        await run(`UPDATE users SET books = COALESCE(books,0) + 2 WHERE id=$1`, [user_id]);
+        awarded_books = 2;
+      }
+    }
+
+    return res.json({ success: true, index: nextIndex, finished: isFinished, awarded_books });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Günlük skip kaydedilemedi" });
+    return res.status(500).json({ error: "Günlük skip kaydedilemedi" });
   }
 });
 
-
-
-// Günlük Leaderboard (bugün)  << answered_count eklendi
+/* ---------- LEADERBOARDS & STATS ---------- */
 app.get("/api/daily/leaderboard", async (req, res) => {
   try {
     const dayKey = req.query.day || await getDayKey();
@@ -969,12 +987,10 @@ app.get("/api/daily/leaderboard", async (req, res) => {
   }
 });
 
-// Günün Yarışması Birincileri (kaç kez 1. olmuş?)
-// book_awards tarafındaki rank=1 kayıtlarından okunur
 app.get("/api/daily/champions", async (req, res) => {
   try {
     const limit = 10;
-    const since = req.query.since || null; // opsiyonel: "YYYY-MM-DD" ve sonrası
+    const since = req.query.since || null;
 
     const params = [];
     let where = `b.rank = 1`;
@@ -987,7 +1003,7 @@ app.get("/api/daily/champions", async (req, res) => {
         u.ad,
         u.soyad,
         COUNT(*)::int AS wins,
-        COUNT(*)::int AS first_wins,   -- UI eski ad bekliyorsa
+        COUNT(*)::int AS first_wins,
         MIN(b.day_key) AS first_win_day,
         MAX(b.day_key) AS last_win_day
       FROM book_awards b
@@ -1007,12 +1023,9 @@ app.get("/api/daily/champions", async (req, res) => {
   }
 });
 
-
-
-// Bugünün (veya ?day=YYYY-MM-DD) özel gün kaydı
 app.get("/api/important-day", async (req, res) => {
   try {
-    const dayKey = req.query.day || await getDayKey(); // Europe/Istanbul
+    const dayKey = req.query.day || await getDayKey();
     const row = await get(
       `SELECT day_key, daytitle, description FROM impdays WHERE day_key=$1`,
       [dayKey]
@@ -1024,10 +1037,6 @@ app.get("/api/important-day", async (req, res) => {
   }
 });
 
-
-
-/* === FEL0X: BOOKS API START === */
-// Kullanıcının kitap sayısı
 app.get("/api/user/:userId/books", async (req, res) => {
   try {
     const row = await get(`SELECT COALESCE(books,0)::int AS books FROM users WHERE id=$1`, [req.params.userId]);
@@ -1037,7 +1046,6 @@ app.get("/api/user/:userId/books", async (req, res) => {
   }
 });
 
-// 1 kitap harca ve doğru cevabı dön
 app.post("/api/books/spend", async (req, res) => {
   try {
     const { user_id, question_id } = req.body || {};
@@ -1064,7 +1072,6 @@ app.post("/api/books/spend", async (req, res) => {
   }
 });
 
-// Dünün kazananlarına ödül ver (idempotent)
 app.post("/api/daily/award-books", async (req, res) => {
   try {
     const targetDay = req.body?.day || await getYesterdayKey();
@@ -1096,7 +1103,7 @@ app.post("/api/daily/award-books", async (req, res) => {
       [targetDay]
     );
 
-    const prizes = [5, 3, 1]; // 1.,2.,3.
+    const prizes = [5, 3, 1];
     const awarded = [];
 
     for (let i = 0; i < winners.length; i++) {
@@ -1123,22 +1130,19 @@ app.post("/api/daily/award-books", async (req, res) => {
     res.status(500).json({ error: "Ödül verilemedi: " + e.message });
   }
 });
-/* === FEL0X: BOOKS API END === */
 
-
-/* ---------- SPEED TIER (Garantici/Tedbirli/Cesur/Âlim) ---------- */
+/* ---------- SPEED TIER ---------- */
 app.get("/api/user/:userId/speed-tier", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
 
-    // Tüm kullanıcıların avg(earned_seconds) dağılımından çeyreklikler
     const thr = await get(
       `
       WITH agg AS (
         SELECT user_id, AVG(earned_seconds)::numeric AS avg_earned
         FROM answers
         WHERE earned_seconds IS NOT NULL
-          AND answer != 'bilmem'                -- yalnız denenen cevaplar
+          AND answer != 'bilmem'
         GROUP BY user_id
       )
       SELECT
@@ -1149,7 +1153,6 @@ app.get("/api/user/:userId/speed-tier", async (req, res) => {
       `
     );
 
-    // Kullanıcının ortalamaları
     const me = await get(
       `
       SELECT
@@ -1179,7 +1182,6 @@ app.get("/api/user/:userId/speed-tier", async (req, res) => {
     }
 
     const avg = Number(me.avg_earned_seconds);
-    // Eğer hiç global veri yoksa (yeni sistem), makul fallback eşikleri kullan
     const p25 = Number(thr?.p25 ?? 6);
     const p50 = Number(thr?.p50 ?? 10);
     const p75 = Number(thr?.p75 ?? 16);
@@ -1188,7 +1190,6 @@ app.get("/api/user/:userId/speed-tier", async (req, res) => {
     if (avg >= p75)       tier = "alim";
     else if (avg >= p50)  tier = "cesur";
     else if (avg >= p25)  tier = "tedbirli";
-    else                  tier = "garantici";
 
     return res.json({
       success: true,
@@ -1203,9 +1204,7 @@ app.get("/api/user/:userId/speed-tier", async (req, res) => {
   }
 });
 
-
-
-/* ---------- STATS & LEADERBOARDS (İstanbul TZ ile) ---------- */
+/* ---------- ADMIN STATS & LEADERBOARDS ---------- */
 app.get("/api/admin/statistics", async (_req, res) => {
   try {
     const a = await get(`SELECT COUNT(*)::int AS count FROM users`);
@@ -1230,7 +1229,6 @@ app.get("/api/admin/statistics", async (_req, res) => {
   } catch { res.status(500).json({ error: "İstatistik hatası!" }); }
 });
 
-// GENEL PUAN TABLOSU
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const period = req.query.period || "all";
@@ -1262,7 +1260,6 @@ app.get("/api/leaderboard", async (req, res) => {
         END
       ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
-      LIMIT 100
       `
     );
     res.json({ success: true, leaderboard: rows });
@@ -1271,7 +1268,6 @@ app.get("/api/leaderboard", async (req, res) => {
   }
 });
 
-// GENEL RANK
 app.get("/api/user/:userId/rank", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -1308,7 +1304,6 @@ app.get("/api/user/:userId/rank", async (req, res) => {
   }
 });
 
-// KATEGORİ (ANKET) BAZLI PUAN TABLOSU
 app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
   try {
     const surveyId = req.params.surveyId;
@@ -1342,7 +1337,6 @@ app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
         END
       ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
-      LIMIT 100
       `,
       [surveyId]
     );
@@ -1352,20 +1346,7 @@ app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
   }
 });
 
-app.get("/api/user/approved-surveys", async (_req, res) => {
-  try {
-    const surveys = await all(`SELECT * FROM surveys WHERE status='approved' ORDER BY id DESC`);
-    if (!surveys.length) return res.json({ success: true, surveys: [] });
-    const filtered = [];
-    for (const survey of surveys) {
-      const row = await get(`SELECT COUNT(*)::int AS question_count FROM questions WHERE survey_id=$1`, [survey.id]);
-      if ((row?.question_count || 0) > 0) filtered.push({ ...survey, question_count: row.question_count });
-    }
-    return res.json({ success: true, surveys: filtered });
-  } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
-});
-
-/* === FEL0X: DAILY AWARD SCHEDULER === */
+/* === AWARD SCHEDULER === */
 let lastAwardedFor = null;
 
 async function awardSchedulerTick() {
@@ -1373,14 +1354,11 @@ async function awardSchedulerTick() {
     const yKey = await getYesterdayKey();
     if (!yKey) return;
 
-    // Aynı güne iki kez verme
     if (lastAwardedFor === yKey) return;
 
-    // Düne zaten ödül verildiyse çık
     const already = await get(`SELECT 1 FROM book_awards WHERE day_key=$1 LIMIT 1`, [yKey]);
     if (already) { lastAwardedFor = yKey; return; }
 
-    // Dünün ilk 3'ünü hesapla (endpoint ile aynı mantık)
     const winners = await all(
       `
       SELECT
@@ -1407,14 +1385,13 @@ async function awardSchedulerTick() {
       [yKey]
     );
 
-    const prizes = [5, 3, 1]; // 1., 2., 3.
+    const prizes = [5, 3, 1];
 
     for (let i = 0; i < winners.length; i++) {
       const u = winners[i];
       const amount = prizes[i] || 0;
       if (amount <= 0) continue;
 
-      // idempotent: aynı güne ikinci kez yazmaz
       const ins = await get(
         `INSERT INTO book_awards (user_id, day_key, rank, amount)
          VALUES ($1,$2,$3,$4)
@@ -1434,7 +1411,6 @@ async function awardSchedulerTick() {
     console.error("awardSchedulerTick hata:", e.message);
   }
 }
-
 
 /* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
