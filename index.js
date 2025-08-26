@@ -36,7 +36,7 @@ pool
     process.exit(1);
   });
 
-/* ---------- MINI DB HELPERS ---------- */
+/* sqlite benzeri yardımcılar */
 async function run(sql, params = []) { await pool.query(sql, params); return { success: true }; }
 async function get(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
@@ -87,54 +87,6 @@ async function getDayKey() {
   return row?.day || new Date().toISOString().slice(0, 10);
 }
 
-/* === bonus hesabı + streak güncelleme === */
-function streakBonus(s) {
-  if (s >= 365) return 10;
-  if (s >= 100) return 6;
-  if (s >= 60)  return 5;
-  if (s >= 30)  return 4;
-  if (s >= 14)  return 3;
-  if (s >= 7)   return 2;
-  if (s >= 3)   return 1;
-  return 0;
-}
-
-/** Bugünü bitirince streak’i günceller (idempotent) */
-async function upsertDailyStreakOnFinish(userId, dayKey) {
-  const st = await get(
-    `SELECT COALESCE(current_streak,0) AS cur,
-            COALESCE(longest_streak,0) AS best,
-            last_day_key::text         AS last
-       FROM user_daily_streak
-      WHERE user_id=$1`,
-    [userId]
-  );
-
-  if (st?.last === dayKey) return;
-
-  let next = 1;
-  if (st?.last) {
-    const cont = await get(
-      `SELECT (($1::date - interval '1 day')::date = $2::date) AS ok`,
-      [dayKey, st.last]
-    );
-    next = cont?.ok ? (st.cur + 1) : 1;
-  }
-
-  const longest = Math.max(st?.best || 0, next);
-
-  await run(
-    `INSERT INTO user_daily_streak (user_id, current_streak, longest_streak, last_day_key)
-     VALUES ($1,$2,$3,$4)
-     ON CONFLICT (user_id) DO UPDATE
-       SET current_streak = EXCLUDED.current_streak,
-           longest_streak = GREATEST(user_daily_streak.longest_streak, EXCLUDED.longest_streak),
-           last_day_key   = EXCLUDED.last_day_key
-    `,
-    [userId, next, longest, dayKey]
-  );
-}
-
 /* === YESTERDAY KEY === */
 async function getYesterdayKey() {
   const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()) - interval '1 day', 'YYYY-MM-DD') AS day`);
@@ -174,6 +126,7 @@ async function init() {
     point INTEGER DEFAULT 1
   )`);
 
+  // günlük set tercihleri için
   await run(`
     ALTER TABLE questions
     ADD COLUMN IF NOT EXISTS qtype integer DEFAULT 1
@@ -279,26 +232,12 @@ async function init() {
     )
   `);
 
-  await run(`
-    ALTER TABLE answers
-      ADD COLUMN IF NOT EXISTS bonus_points integer DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS streak_len_at_answer integer
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS user_daily_streak (
-      user_id        INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      current_streak INTEGER NOT NULL DEFAULT 0,
-      longest_streak INTEGER NOT NULL DEFAULT 0,
-      last_day_key   DATE
-    )
-  `);
-
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_daily ON answers (is_daily, daily_key, user_id)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_user_q ON answers (user_id, question_id)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
-}
+
+  
 
 init()
   .then(() => {
@@ -458,92 +397,26 @@ app.get("/api/quotes/random", async (_req, res) => {
 });
 
 /* ---------- USER ---------- */
-// Onaylı kategoriler: FE (Kategori listesi, Rastgele, başlık eşleşmesi) BUNA dayanıyor
-app.get("/api/user/approved-surveys", async (req, res) => {
+app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   try {
-    // 1) Şemayı kesinleştir (public) + basit JOIN
-    const rows = await all(`
-      SELECT s.id,
-             s.title,
-             COALESCE(COUNT(q.id),0)::int AS question_count
-        FROM public.surveys   s
-   LEFT JOIN public.questions q ON q.survey_id = s.id
-       WHERE s.status = 'approved'
-    GROUP BY s.id, s.title
-    ORDER BY s.id DESC
-    `);
-
-    // 2) Hiç kayıt dönmediyse: eski iki-aşamalı yöntemle fallback (bazı ortamlarda JOIN/şema/aranan tablo çakışması olabilir)
-    if (!rows || rows.length === 0) {
-      const surveys = await all(`
-        SELECT id, title
-          FROM public.surveys
-         WHERE status = 'approved'
-      ORDER BY id DESC
-      `);
-
-      const out = [];
-      for (const s of surveys) {
-        const cnt = await get(`SELECT COUNT(*)::int AS c FROM public.questions WHERE survey_id = $1`, [s.id]);
-        out.push({ id: s.id, title: s.title, question_count: cnt?.c || 0 });
-      }
-
-      // debug=1 verilirse debug nesnesi de dön
-      if (String(req.query.debug) === "1") {
-        return res.json({ success: true, surveys: out, debug: { strategy: "fallback", approved_count: surveys.length } });
-      }
-      return res.json({ success: true, surveys: out });
-    }
-
-    // debug=1 verilirse debug nesnesi de dön
-    if (String(req.query.debug) === "1") {
-      return res.json({ success: true, surveys: rows, debug: { strategy: "join", count: rows.length } });
-    }
-
-    return res.json({ success: true, surveys: rows });
-  } catch (e) {
-    console.error("approved-surveys fail:", e);
-    res.status(500).json({ error: "Onaylı kategoriler alınamadı" });
-  }
+    const rows = await all(`SELECT * FROM questions WHERE survey_id=$1 ORDER BY id ASC`, [req.params.surveyId]);
+    res.json({ success: true, questions: rows });
+  } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
-
-// Eski/alternatif yollar (FE bazı yerlerde bunları kullanıyor olabilir)
-app.get("/api/approved-surveys", (req, res) => app._router.handle(req, res, () => {}, "/api/user/approved-surveys"));
-app.get("/api/categories/approved", (req, res) => app._router.handle(req, res, () => {}, "/api/user/approved-surveys"));
-
-app.get("/api/debug/whoami", async (_req, res) => {
-  try {
-    const a = await get(`SELECT COUNT(*)::int AS c FROM public.surveys WHERE status='approved'`);
-    const b = await get(`SELECT COUNT(*)::int AS c FROM public.questions`);
-    res.json({
-      ok: true,
-      approved_surveys: a?.c || 0,
-      questions: b?.c || 0
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
 
 /* --------- CEVAP KAYDI ---------- */
 async function insertAnswer({
   user_id, question_id, norm_answer, is_correct,
-  maxSec, leftSec, earned, isDaily = false, dailyKey = null,
-  bonusPoints = 0, streakLenAtAnswer = null
+  maxSec, leftSec, earned, isDaily = false, dailyKey = null
 }) {
   await run(`
     INSERT INTO answers
       (user_id, question_id, answer, is_correct, created_at,
        max_time_seconds, time_left_seconds, earned_seconds,
-       is_daily, daily_key, bonus_points, streak_len_at_answer)
+       is_daily, daily_key)
     VALUES ($1,$2,$3,$4, timezone('Europe/Istanbul', now()),
-            $5,$6,$7,$8,$9,$10,$11)
-  `, [
-    user_id, question_id, norm_answer, is_correct,
-    maxSec, leftSec, earned, isDaily, dailyKey,
-    bonusPoints, streakLenAtAnswer
-  ]);
+            $5,$6,$7,$8,$9)
+  `, [user_id, question_id, norm_answer, is_correct, maxSec, leftSec, earned, isDaily, dailyKey]);
 }
 
 app.post("/api/answers", async (req, res) => {
@@ -590,24 +463,19 @@ app.get("/api/user/:userId/answered", async (req, res) => {
 app.get("/api/user/:userId/total-points", async (req, res) => {
   try {
     const rows = await all(
-      `SELECT a.answer, a.is_correct, a.bonus_points, q.point
-         FROM answers a
-         INNER JOIN questions q ON a.question_id = q.id
-        WHERE a.user_id=$1`,
-      [req.params.userId]
+      `SELECT a.answer, a.is_correct, q.point
+       FROM answers a
+       INNER JOIN questions q ON a.question_id = q.id
+       WHERE a.user_id=$1`, [req.params.userId]
     );
-
     let total = 0;
     rows.forEach(r => {
-      if (r.answer === "bilmem") return;
-      if (r.is_correct === 1) total += (r.point || 1) + (r.bonus_points || 0);
-      else                    total -= (r.point || 1);
+      if (r.answer === "bilmem") { /* 0 */ }
+      else if (r.is_correct === 1) total += r.point || 1;
+      else total -= r.point || 1;
     });
-
     res.json({ success: true, totalPoints: total, answeredCount: rows.length });
-  } catch (e) {
-    res.status(500).json({ error: "Puan alınamadı: " + e.message });
-  }
+  } catch { res.status(500).json({ error: "Puan alınamadı" }); }
 });
 
 app.get("/api/user/:userId/score", async (req, res) => {
@@ -671,11 +539,11 @@ app.get("/api/user/:userId/performance", async (req, res) => {
         COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct,
         COALESCE(SUM(CASE WHEN a.is_correct = 0 AND a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS wrong,
         COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0
-                          WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0) ELSE 0 END),0)::int AS earned_points,
+                          WHEN a.is_correct = 1 THEN q.point ELSE 0 END),0)::int AS earned_points,
         COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0 ELSE q.point END),0)::int AS possible_points,
         COALESCE(SUM(CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
         END),0)::int AS net_points
@@ -910,54 +778,25 @@ app.get("/api/daily/status", async (req, res) => {
     const size = DAILY_CONTEST_SIZE;
 
     const session = await getOrCreateDailySession(user_id, dayKey);
-    const idx = Math.max(0, Number(session.current_index || 0));
+    let idx = Math.max(0, Number(session.current_index || 0));
+
     const ids = await getOrCreateDailySetIds(dayKey, size);
     const finished = !!session.finished || idx >= ids.length;
 
-    const st = await get(
-      `SELECT COALESCE(current_streak,0) AS cur, last_day_key::text AS last
-         FROM user_daily_streak WHERE user_id=$1`,
-      [user_id]
-    );
-    const streak_current = st?.cur || 0;
-    const todayBonusBase = (st?.last === dayKey) ? Math.max(0, streak_current - 1) : streak_current;
-    const today_bonus_per_correct = streakBonus(todayBonusBase);
-
     if (finished) {
       return res.json({
-        success: true,
-        day_key: dayKey,
-        finished: true,
-        index: Math.min(idx, ids.length),
-        size: ids.length,
-        question: null,
-        streak_current,
-        today_bonus_per_correct
+        success: true, day_key: dayKey, finished: true,
+        index: Math.min(idx, ids.length), size: ids.length, question: null
       });
     }
 
-    const q = await get(`
-  SELECT q.id, q.question, q.point, q.survey_id, s.title AS survey_title
-  FROM questions q
-  LEFT JOIN surveys s ON s.id = q.survey_id
-  WHERE q.id = $1
-`, [ids[idx]]);
-
+    const q = await get(`SELECT id, question, point FROM questions WHERE id=$1`, [ids[idx]]);
     if (!q) return res.status(500).json({ error: "Soru setinde geçersiz id" });
 
-    res.json({
-      success: true,
-      day_key: dayKey,
-      finished: false,
-      index: idx,
-      size: ids.length,
-      question: q,
-      streak_current,
-      today_bonus_per_correct
-    });
+    res.json({ success: true, day_key: dayKey, finished: false, index: idx, size: ids.length, question: q });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Günlük durum alınamadı: " + e.message });
+    res.status(500).json({ error: "Günlük durum alınamadı" });
   }
 });
 
@@ -973,11 +812,7 @@ app.post("/api/daily/answer", async (req, res) => {
     const session = await getOrCreateDailySession(user_id, dayKey);
     const ids = await getOrCreateDailySetIds(dayKey, size);
 
-    // set zaten bitmişse: idempotent streak + dönüş
     if (session.finished || session.current_index >= ids.length) {
-      try { await upsertDailyStreakOnFinish(user_id, dayKey); } catch (err) {
-        console.error("streak update fail:", err.message);
-      }
       return res.json({ success: true, finished: true, message: "Bugünün yarışması tamamlandı" });
     }
 
@@ -999,16 +834,6 @@ app.post("/api/daily/answer", async (req, res) => {
     const leftSec = Math.max(0, Math.min(leftSecRaw, maxSec));
     const earned = leftSec;
 
-    // bonus: o anki streak (dün dahil)
-    const st = await get(
-      `SELECT COALESCE(current_streak,0) AS cur, last_day_key::text AS last
-         FROM user_daily_streak WHERE user_id=$1`,
-      [user_id]
-    );
-    const curStreak = st?.cur || 0;
-    const bonusPerCorrect = streakBonus(curStreak);
-    const bonusPoints = (is_correct === 1) ? bonusPerCorrect : 0;
-
     await insertAnswer({
       user_id,
       question_id,
@@ -1018,9 +843,7 @@ app.post("/api/daily/answer", async (req, res) => {
       leftSec,
       earned,
       isDaily: true,
-      dailyKey: dayKey,
-      bonusPoints,
-      streakLenAtAnswer: curStreak
+      dailyKey: dayKey
     });
 
     const nextIndex = session.current_index + 1;
@@ -1045,22 +868,9 @@ app.post("/api/daily/answer", async (req, res) => {
         await run(`UPDATE users SET books = COALESCE(books,0) + 2 WHERE id=$1`, [user_id]);
         awarded_books = 2;
       }
-
-      // set bitti: streak’i artır
-      try { await upsertDailyStreakOnFinish(user_id, dayKey); } catch (err) {
-        console.error("streak update fail:", err.message);
-      }
     }
 
-    return res.json({
-  success: true,
-  is_correct,
-  index: nextIndex,
-  finished: isFinished,
-  awarded_books,
-  bonus_points: bonusPoints
-});
-
+    return res.json({ success: true, is_correct, index: nextIndex, finished: isFinished, awarded_books });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Günlük cevap kaydedilemedi" });
@@ -1079,21 +889,15 @@ app.post("/api/daily/skip", async (req, res) => {
     const session = await getOrCreateDailySession(user_id, dayKey);
     const ids = await getOrCreateDailySetIds(dayKey, size);
 
-    // Set zaten bitmişse: idempotent streak + dönüş
     if (session.finished || session.current_index >= ids.length) {
-      try { await upsertDailyStreakOnFinish(user_id, dayKey); } catch (err) {
-        console.error("streak update fail:", err.message);
-      }
       return res.json({ success: true, finished: true });
     }
 
-    // Doğru sıradaki soruyu kontrol et
     const expectedId = ids[session.current_index];
     if (!expectedId || Number(expectedId) !== Number(question_id)) {
       return res.status(409).json({ error: "Soru senkron değil. Sayfayı yenileyin." });
     }
 
-    // Süre hesapları
     const parsedMax = Number(max_time_seconds);
     const parsedLeft = Number(time_left_seconds);
     const maxSec = Number.isFinite(parsedMax) ? Math.max(1, Math.min(120, Math.round(parsedMax))) : 24;
@@ -1101,7 +905,6 @@ app.post("/api/daily/skip", async (req, res) => {
     const leftSec = Math.max(0, Math.min(leftSecRaw, maxSec));
     const earned = leftSec;
 
-    // Skip = "bilmem", puan yazılmaz ama kayıt atılır
     await insertAnswer({
       user_id,
       question_id,
@@ -1114,10 +917,8 @@ app.post("/api/daily/skip", async (req, res) => {
       dailyKey: dayKey
     });
 
-    // İlerlet
     const nextIndex = session.current_index + 1;
     const isFinished = nextIndex >= ids.length;
-
     await run(
       `UPDATE daily_sessions
          SET current_index=$1, finished=$2, updated_at=timezone('Europe/Istanbul', now())
@@ -1125,7 +926,6 @@ app.post("/api/daily/skip", async (req, res) => {
       [nextIndex, isFinished, session.id]
     );
 
-    // Bittiyse günlük tamamlama ödülü + streak güncelle
     let awarded_books = 0;
     if (isFinished) {
       const ins = await get(`
@@ -1139,10 +939,6 @@ app.post("/api/daily/skip", async (req, res) => {
         await run(`UPDATE users SET books = COALESCE(books,0) + 2 WHERE id=$1`, [user_id]);
         awarded_books = 2;
       }
-
-      try { await upsertDailyStreakOnFinish(user_id, dayKey); } catch (err) {
-        console.error("streak update fail:", err.message);
-      }
     }
 
     return res.json({ success: true, index: nextIndex, finished: isFinished, awarded_books });
@@ -1151,7 +947,6 @@ app.post("/api/daily/skip", async (req, res) => {
     return res.status(500).json({ error: "Günlük skip kaydedilemedi" });
   }
 });
-
 
 /* ---------- LEADERBOARDS & STATS ---------- */
 app.get("/api/daily/leaderboard", async (req, res) => {
@@ -1167,7 +962,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1289,7 +1084,7 @@ app.post("/api/daily/award-books", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1445,7 +1240,7 @@ app.get("/api/leaderboard", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1457,13 +1252,13 @@ app.get("/api/leaderboard", async (req, res) => {
         ${periodClause}
       GROUP BY u.id
       HAVING COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ), 0) != 0
+        CASE
+          WHEN a.answer = 'bilmem' THEN 0
+          WHEN a.is_correct = 1 THEN q.point
+          WHEN a.is_correct = 0 THEN -q.point
+          ELSE 0
+        END
+      ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
       `
     );
@@ -1485,7 +1280,7 @@ app.get("/api/user/:userId/rank", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1521,7 +1316,7 @@ app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1534,13 +1329,13 @@ app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
         AND a.question_id IN (SELECT id FROM questions WHERE survey_id = $1)
       GROUP BY u.id
       HAVING COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ), 0) != 0
+        CASE
+          WHEN a.answer = 'bilmem' THEN 0
+          WHEN a.is_correct = 1 THEN q.point
+          WHEN a.is_correct = 0 THEN -q.point
+          ELSE 0
+        END
+      ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
       `,
       [surveyId]
@@ -1571,7 +1366,7 @@ async function awardSchedulerTick() {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 1 THEN q.point
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
