@@ -458,40 +458,72 @@ app.get("/api/quotes/random", async (_req, res) => {
 });
 
 /* ---------- USER ---------- */
-app.get("/api/surveys/:surveyId/questions", async (req, res) => {
+// Onaylı kategoriler: FE (Kategori listesi, Rastgele, başlık eşleşmesi) BUNA dayanıyor
+app.get("/api/user/approved-surveys", async (req, res) => {
   try {
-    const rows = await all(`SELECT * FROM questions WHERE survey_id=$1 ORDER BY id ASC`, [req.params.surveyId]);
-    res.json({ success: true, questions: rows });
-  } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
-});
-
-// FE geriye dönük uyum: birden çok route ve hem surveys hem categories anahtarı
-const approvedSurveysHandler = async (_req, res) => {
-  try {
+    // 1) Şemayı kesinleştir (public) + basit JOIN
     const rows = await all(`
       SELECT s.id,
              s.title,
-             s.category,
              COALESCE(COUNT(q.id),0)::int AS question_count
-      FROM surveys s
-      LEFT JOIN questions q ON q.survey_id = s.id
-      WHERE s.status = 'approved'
-      GROUP BY s.id, s.title, s.category
-      ORDER BY s.id DESC
+        FROM public.surveys   s
+   LEFT JOIN public.questions q ON q.survey_id = s.id
+       WHERE s.status = 'approved'
+    GROUP BY s.id, s.title
+    ORDER BY s.id DESC
     `);
-    // Bazı FE'ler "categories" bekliyor olabilir; ikisini de veriyoruz
-    res.json({ success: true, surveys: rows, categories: rows });
+
+    // 2) Hiç kayıt dönmediyse: eski iki-aşamalı yöntemle fallback (bazı ortamlarda JOIN/şema/aranan tablo çakışması olabilir)
+    if (!rows || rows.length === 0) {
+      const surveys = await all(`
+        SELECT id, title
+          FROM public.surveys
+         WHERE status = 'approved'
+      ORDER BY id DESC
+      `);
+
+      const out = [];
+      for (const s of surveys) {
+        const cnt = await get(`SELECT COUNT(*)::int AS c FROM public.questions WHERE survey_id = $1`, [s.id]);
+        out.push({ id: s.id, title: s.title, question_count: cnt?.c || 0 });
+      }
+
+      // debug=1 verilirse debug nesnesi de dön
+      if (String(req.query.debug) === "1") {
+        return res.json({ success: true, surveys: out, debug: { strategy: "fallback", approved_count: surveys.length } });
+      }
+      return res.json({ success: true, surveys: out });
+    }
+
+    // debug=1 verilirse debug nesnesi de dön
+    if (String(req.query.debug) === "1") {
+      return res.json({ success: true, surveys: rows, debug: { strategy: "join", count: rows.length } });
+    }
+
+    return res.json({ success: true, surveys: rows });
   } catch (e) {
+    console.error("approved-surveys fail:", e);
     res.status(500).json({ error: "Onaylı kategoriler alınamadı" });
   }
-};
+});
 
-app.get("/api/user/approved-surveys", approvedSurveysHandler);
-// Eski/alternatif yollar – FE hangisini çağırırsa çağırsa çalışsın:
-app.get("/api/approved-surveys", approvedSurveysHandler);
-app.get("/api/surveys/approved", approvedSurveysHandler);
-app.get("/api/categories/approved", approvedSurveysHandler);
+// Eski/alternatif yollar (FE bazı yerlerde bunları kullanıyor olabilir)
+app.get("/api/approved-surveys", (req, res) => app._router.handle(req, res, () => {}, "/api/user/approved-surveys"));
+app.get("/api/categories/approved", (req, res) => app._router.handle(req, res, () => {}, "/api/user/approved-surveys"));
 
+app.get("/api/debug/whoami", async (_req, res) => {
+  try {
+    const a = await get(`SELECT COUNT(*)::int AS c FROM public.surveys WHERE status='approved'`);
+    const b = await get(`SELECT COUNT(*)::int AS c FROM public.questions`);
+    res.json({
+      ok: true,
+      approved_surveys: a?.c || 0,
+      questions: b?.c || 0
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 
 /* --------- CEVAP KAYDI ---------- */
