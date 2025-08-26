@@ -42,7 +42,7 @@ async function get(sql, params = []) { const { rows } = await pool.query(sql, pa
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
 
 /* ---------- ENV (Günlük Yarışma) ---------- */
-const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
+const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "24", 10));
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
 
 /* ---------- HEALTH ---------- */
