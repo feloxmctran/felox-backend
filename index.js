@@ -395,6 +395,34 @@ app.get("/api/surveys/:surveyId/details", async (req, res) => {
   } catch { res.status(500).json({ error: "Sorular bulunamadı!" }); }
 });
 
+// === SURVEY QUESTIONS (FE'nin beklediği uç) ===
+app.get("/api/surveys/:surveyId/questions", async (req, res) => {
+  try {
+    const surveyId = req.params.surveyId;
+
+    // Anket var mı? (silinmemiş)
+    const sv = await get(
+      `SELECT id FROM surveys WHERE id = $1 AND status != 'deleted'`,
+      [surveyId]
+    );
+    if (!sv) return res.status(404).json({ error: "Anket bulunamadı" });
+
+    // FE'nin kullandığı alanlar: id, survey_id, question, point
+    const rows = await all(
+      `SELECT id, survey_id, question, point
+         FROM questions
+        WHERE survey_id = $1
+        ORDER BY id ASC`,
+      [surveyId]
+    );
+
+    res.json({ success: true, questions: rows });
+  } catch (e) {
+    res.status(500).json({ error: "Sorular alınamadı: " + e.message });
+  }
+});
+
+
 app.post("/api/surveys/:surveyId/delete", async (req, res) => {
   try { await run(`UPDATE surveys SET status='deleted' WHERE id=$1`, [req.params.surveyId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Silinemedi." }); }
