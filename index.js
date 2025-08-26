@@ -465,6 +465,35 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   } catch { res.status(500).json({ error: "Soru listesi hatası!" }); }
 });
 
+// FE geriye dönük uyum: birden çok route ve hem surveys hem categories anahtarı
+const approvedSurveysHandler = async (_req, res) => {
+  try {
+    const rows = await all(`
+      SELECT s.id,
+             s.title,
+             s.category,
+             COALESCE(COUNT(q.id),0)::int AS question_count
+      FROM surveys s
+      LEFT JOIN questions q ON q.survey_id = s.id
+      WHERE s.status = 'approved'
+      GROUP BY s.id, s.title, s.category
+      ORDER BY s.id DESC
+    `);
+    // Bazı FE'ler "categories" bekliyor olabilir; ikisini de veriyoruz
+    res.json({ success: true, surveys: rows, categories: rows });
+  } catch (e) {
+    res.status(500).json({ error: "Onaylı kategoriler alınamadı" });
+  }
+};
+
+app.get("/api/user/approved-surveys", approvedSurveysHandler);
+// Eski/alternatif yollar – FE hangisini çağırırsa çağırsa çalışsın:
+app.get("/api/approved-surveys", approvedSurveysHandler);
+app.get("/api/surveys/approved", approvedSurveysHandler);
+app.get("/api/categories/approved", approvedSurveysHandler);
+
+
+
 /* --------- CEVAP KAYDI ---------- */
 async function insertAnswer({
   user_id, question_id, norm_answer, is_correct,
@@ -610,11 +639,11 @@ app.get("/api/user/:userId/performance", async (req, res) => {
         COALESCE(SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END),0)::int AS correct,
         COALESCE(SUM(CASE WHEN a.is_correct = 0 AND a.answer != 'bilmem' THEN 1 ELSE 0 END),0)::int AS wrong,
         COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0
-                          WHEN a.is_correct = 1 THEN q.point ELSE 0 END),0)::int AS earned_points,
+                          WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0) ELSE 0 END),0)::int AS earned_points,
         COALESCE(SUM(CASE WHEN a.answer = 'bilmem' THEN 0 ELSE q.point END),0)::int AS possible_points,
         COALESCE(SUM(CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
         END),0)::int AS net_points
@@ -875,7 +904,13 @@ app.get("/api/daily/status", async (req, res) => {
       });
     }
 
-    const q = await get(`SELECT id, question, point FROM questions WHERE id=$1`, [ids[idx]]);
+    const q = await get(`
+  SELECT q.id, q.question, q.point, q.survey_id, s.title AS survey_title
+  FROM questions q
+  LEFT JOIN surveys s ON s.id = q.survey_id
+  WHERE q.id = $1
+`, [ids[idx]]);
+
     if (!q) return res.status(500).json({ error: "Soru setinde geçersiz id" });
 
     res.json({
@@ -985,7 +1020,15 @@ app.post("/api/daily/answer", async (req, res) => {
       }
     }
 
-    return res.json({ success: true, is_correct, index: nextIndex, finished: isFinished, awarded_books });
+    return res.json({
+  success: true,
+  is_correct,
+  index: nextIndex,
+  finished: isFinished,
+  awarded_books,
+  bonus_points: bonusPoints
+});
+
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Günlük cevap kaydedilemedi" });
@@ -1092,7 +1135,7 @@ app.get("/api/daily/leaderboard", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1214,7 +1257,7 @@ app.post("/api/daily/award-books", async (req, res) => {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
@@ -1496,7 +1539,7 @@ async function awardSchedulerTick() {
         COALESCE(SUM(
           CASE
             WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
             WHEN a.is_correct = 0 THEN -q.point
             ELSE 0
           END
