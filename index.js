@@ -42,7 +42,7 @@ async function get(sql, params = []) { const { rows } = await pool.query(sql, pa
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
 
 /* ---------- ENV (Günlük Yarışma) ---------- */
-const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "24", 10));
+const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
 
 /* ---------- HEALTH ---------- */
@@ -734,6 +734,11 @@ app.get("/api/user/:userId/performance", async (req, res) => {
   }
 });
 
+// --- KADEMELİ: seviye atlama şartları ---
+const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS || 10); // en az 10 deneme
+const LADDER_REQUIRED_RATE = Number(process.env.LADDER_REQUIRED_RATE || 0.8); // %80 başarı
+
+
 /* ---------- KADEMELİ YARIŞ ---------- */
 app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
@@ -798,7 +803,7 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
       attempted,
       correct,
       success_rate,
-      can_level_up: (attempted >= 100 && success_rate >= 0.8)
+      can_level_up: (attempted >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE)
     });
   } catch (e) {
     console.error(e);
@@ -829,7 +834,7 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
     const attempted = row?.attempted || 0;
     const correct = row?.correct || 0;
     const success_rate = attempted > 0 ? correct / attempted : 0;
-    const ok = (attempted >= 100 && success_rate >= 0.8);
+    const ok = (attempted >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE);
 
     if (ok) {
       if (point >= 10) {
