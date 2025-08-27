@@ -256,6 +256,11 @@ async function init() {
     ADD COLUMN IF NOT EXISTS books integer DEFAULT 0
   `);
 
+    await run(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS ladder_best_level integer DEFAULT 0
+  `);
+
   await run(`
     CREATE TABLE IF NOT EXISTS book_awards (
       id SERIAL PRIMARY KEY,
@@ -486,8 +491,8 @@ app.get("/api/quotes/random", async (_req, res) => {
 });
 
 /* ---------- USER ---------- */
-// Onaylı kategoriler: FE (Kategori listesi, Rastgele, başlık eşleşmesi) BUNA dayanıyor
-app.get("/api/user/approved-surveys", async (req, res) => {
+// Onaylı kategoriler handler'ı: 3 route aynı fonksiyonu kullanır
+async function handleApprovedSurveys(req, res) {
   try {
     // 1) Şemayı kesinleştir (public) + basit JOIN
     const rows = await all(`
@@ -501,7 +506,7 @@ app.get("/api/user/approved-surveys", async (req, res) => {
     ORDER BY s.id DESC
     `);
 
-    // 2) Hiç kayıt dönmediyse: eski iki-aşamalı yöntemle fallback (bazı ortamlarda JOIN/şema/aranan tablo çakışması olabilir)
+    // 2) Hiç kayıt dönmediyse: eski iki-aşamalı yöntemle fallback
     if (!rows || rows.length === 0) {
       const surveys = await all(`
         SELECT id, title
@@ -512,20 +517,29 @@ app.get("/api/user/approved-surveys", async (req, res) => {
 
       const out = [];
       for (const s of surveys) {
-        const cnt = await get(`SELECT COUNT(*)::int AS c FROM public.questions WHERE survey_id = $1`, [s.id]);
+        const cnt = await get(
+          `SELECT COUNT(*)::int AS c FROM public.questions WHERE survey_id = $1`,
+          [s.id]
+        );
         out.push({ id: s.id, title: s.title, question_count: cnt?.c || 0 });
       }
 
-      // debug=1 verilirse debug nesnesi de dön
       if (String(req.query.debug) === "1") {
-        return res.json({ success: true, surveys: out, debug: { strategy: "fallback", approved_count: surveys.length } });
+        return res.json({
+          success: true,
+          surveys: out,
+          debug: { strategy: "fallback", approved_count: surveys.length },
+        });
       }
       return res.json({ success: true, surveys: out });
     }
 
-    // debug=1 verilirse debug nesnesi de dön
     if (String(req.query.debug) === "1") {
-      return res.json({ success: true, surveys: rows, debug: { strategy: "join", count: rows.length } });
+      return res.json({
+        success: true,
+        surveys: rows,
+        debug: { strategy: "join", count: rows.length },
+      });
     }
 
     return res.json({ success: true, surveys: rows });
@@ -533,11 +547,13 @@ app.get("/api/user/approved-surveys", async (req, res) => {
     console.error("approved-surveys fail:", e);
     res.status(500).json({ error: "Onaylı kategoriler alınamadı" });
   }
-});
+}
 
-// Eski/alternatif yollar (FE bazı yerlerde bunları kullanıyor olabilir)
-app.get("/api/approved-surveys", (req, res) => app._router.handle(req, res, () => {}, "/api/user/approved-surveys"));
-app.get("/api/categories/approved", (req, res) => app._router.handle(req, res, () => {}, "/api/user/approved-surveys"));
+// ÜÇ route'u aynı handler'a bağla
+app.get("/api/user/approved-surveys", handleApprovedSurveys);
+app.get("/api/approved-surveys", handleApprovedSurveys);
+app.get("/api/categories/approved", handleApprovedSurveys);
+
 
 app.get("/api/debug/whoami", async (_req, res) => {
   try {
@@ -737,6 +753,18 @@ app.get("/api/user/:userId/performance", async (req, res) => {
 // --- KADEMELİ: seviye atlama şartları ---
 const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS || 10); // en az 10 deneme
 const LADDER_REQUIRED_RATE = Number(process.env.LADDER_REQUIRED_RATE || 0.8); // %80 başarı
+const LADDER_DEFAULT_LIMIT = Math.max(1, parseInt(process.env.LADDER_QUESTIONS_LIMIT || "20", 10));
+
+// En iyi (erişilen) seviye günceller
+async function bumpLadderBest(userId, level) {
+  const safe = Math.max(0, Math.min(10, Number(level) || 0));
+  await run(
+    `UPDATE users
+       SET ladder_best_level = GREATEST(COALESCE(ladder_best_level,0), $2)
+     WHERE id = $1`,
+    [userId, safe]
+  );
+}
 
 
 /* ---------- KADEMELİ YARIŞ ---------- */
@@ -744,7 +772,7 @@ app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
     const point = Number(req.query.point || 1);
-    const limit = Math.min(1000, Math.max(10, Number(req.query.limit || 200)));
+    const limit = Math.min(1000, Math.max(10, Number(req.query.limit || LADDER_DEFAULT_LIMIT)));
     if (!point || point < 1 || point > 10) {
       return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
     }
@@ -837,17 +865,78 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
     const ok = (attempted >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE);
 
     if (ok) {
-      if (point >= 10) {
-        return res.json({ success: true, status: "genius", can_level_up: true, next_point: 10 });
-      }
-      return res.json({ success: true, status: "ok", can_level_up: true, next_point: point + 1 });
-    }
-    res.json({ success: true, status: "stay", can_level_up: false, next_point: point });
+  const next = (point >= 10) ? 10 : (point + 1);
+  try { await bumpLadderBest(userId, next); } catch (e) { /* sessiz */ }
+
+  if (point >= 10) {
+    return res.json({
+      success: true,
+      status: "genius",
+      can_level_up: true,
+      next_point: 10,
+      best_level: next
+    });
+  }
+  return res.json({
+    success: true,
+    status: "ok",
+    can_level_up: true,
+    next_point: point + 1,
+    best_level: next
+  });
+}
+
+// Kalamıyorsa mevcut best'i de dönelim
+const bestRow = await get(
+  `SELECT COALESCE(ladder_best_level,0)::int AS best FROM users WHERE id=$1`,
+  [userId]
+);
+return res.json({
+  success: true,
+  status: "stay",
+  can_level_up: false,
+  next_point: point,
+  best_level: bestRow?.best || 0
+});
+
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Seviye kontrolü yapılamadı" });
   }
 });
+
+// --- KADEMELİ: en iyi (erişilen) seviye: sadece oku ---
+app.get("/api/user/:userId/ladder-best-level", async (req, res) => {
+  try {
+    const row = await get(
+      `SELECT COALESCE(ladder_best_level,0)::int AS best_level
+         FROM users
+        WHERE id = $1`,
+      [req.params.userId]
+    );
+    res.json({ success: true, best_level: row?.best_level || 0 });
+  } catch (e) {
+    res.status(500).json({ error: "En iyi kademe alınamadı" });
+  }
+});
+
+// --- KADEMELİ: en iyi (erişilen) seviye: yaz (frontend'in beklediği) ---
+app.post("/api/user/:userId/ladder-best-level", async (req, res) => {
+  try {
+    const uid = Number(req.params.userId);
+    const level = Math.max(0, Math.min(10, Number(req.body?.level) || 0));
+    await run(
+      `UPDATE users
+         SET ladder_best_level = GREATEST(COALESCE(ladder_best_level,0), $2)
+       WHERE id = $1`,
+      [uid, level]
+    );
+    res.json({ success: true, best_level: level });
+  } catch (e) {
+    res.status(500).json({ error: "En iyi kademe yazılamadı: " + e.message });
+  }
+});
+
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 async function getOrCreateDailySetIds(dayKey, size) {
