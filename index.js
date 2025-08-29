@@ -256,7 +256,7 @@ async function init() {
     ADD COLUMN IF NOT EXISTS books integer DEFAULT 0
   `);
 
-    await run(`
+  await run(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS ladder_best_level integer DEFAULT 0
   `);
@@ -300,24 +300,21 @@ async function init() {
   `);
 
   await run(`
-  CREATE TABLE IF NOT EXISTS ladder_sessions (
-    user_id       INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    run_started_at TIMESTAMP DEFAULT timezone('Europe/Istanbul', now()),
-    current_level  INTEGER NOT NULL DEFAULT 1,
-    attempts       INTEGER NOT NULL DEFAULT 0,  -- bilmem hariç deneme
-    correct        INTEGER NOT NULL DEFAULT 0,  -- doğru sayısı
-    updated_at     TIMESTAMP DEFAULT timezone('Europe/Istanbul', now())
-  )
-`);
-
+    CREATE TABLE IF NOT EXISTS ladder_sessions (
+      user_id        INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      run_started_at TIMESTAMP DEFAULT timezone('Europe/Istanbul', now()),
+      current_level  INTEGER NOT NULL DEFAULT 1,
+      attempts       INTEGER NOT NULL DEFAULT 0,  -- bilmem hariç deneme
+      correct        INTEGER NOT NULL DEFAULT 0,  -- doğru sayısı
+      updated_at     TIMESTAMP DEFAULT timezone('Europe/Istanbul', now())
+    )
+  `);
 
   await run(`CREATE INDEX IF NOT EXISTS idx_answers_daily ON answers (is_daily, daily_key, user_id)`);
-await run(`CREATE INDEX IF NOT EXISTS idx_answers_user_q ON answers (user_id, question_id)`);
-await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
-await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
-await run(`CREATE INDEX IF NOT EXISTS idx_ladder_sessions_user_level ON ladder_sessions (user_id, current_level)`);
-
-
+  await run(`CREATE INDEX IF NOT EXISTS idx_answers_user_q ON answers (user_id, question_id)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_ladder_sessions_user_level ON ladder_sessions (user_id, current_level)`);
 }
 
 init()
@@ -441,7 +438,6 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
     res.status(500).json({ error: "Sorular alınamadı: " + e.message });
   }
 });
-
 
 app.post("/api/surveys/:surveyId/delete", async (req, res) => {
   try { await run(`UPDATE surveys SET status='deleted' WHERE id=$1`, [req.params.surveyId]); res.json({ success: true }); }
@@ -569,7 +565,6 @@ app.get("/api/user/approved-surveys", handleApprovedSurveys);
 app.get("/api/approved-surveys", handleApprovedSurveys);
 app.get("/api/categories/approved", handleApprovedSurveys);
 
-
 app.get("/api/debug/whoami", async (_req, res) => {
   try {
     const a = await get(`SELECT COUNT(*)::int AS c FROM public.surveys WHERE status='approved'`);
@@ -583,7 +578,6 @@ app.get("/api/debug/whoami", async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
-
 
 /* --------- CEVAP KAYDI ---------- */
 async function insertAnswer({
@@ -710,8 +704,6 @@ app.post("/api/ladder/answer", async (req, res) => {
     return res.status(500).json({ error: "Kademeli cevap kaydedilemedi" });
   }
 });
-
-
 
 app.get("/api/user/:userId/answers", async (req, res) => {
   try {
@@ -847,7 +839,7 @@ app.get("/api/user/:userId/performance", async (req, res) => {
 });
 
 // --- KADEMELİ: seviye atlama şartları ---
-const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS || 10); // en az 10 deneme
+const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS ?? 100); // varsayılanı 100 (ürün kuralı)
 const LADDER_REQUIRED_RATE = Number(process.env.LADDER_REQUIRED_RATE || 0.8); // %80 başarı
 const LADDER_DEFAULT_LIMIT = Math.max(1, parseInt(process.env.LADDER_QUESTIONS_LIMIT || "20", 10));
 
@@ -861,7 +853,6 @@ async function bumpLadderBest(userId, level) {
     [userId, safe]
   );
 }
-
 
 // === KADEMELİ: oturum (run) yöneticisi ===
 // Her kullanıcı için tek bir aktif ladder oturumu tutar.
@@ -899,7 +890,6 @@ async function ensureLadderSession(userId, level, forceReset = false) {
   );
 }
 
-
 /* ---------- KADEMELİ YARIŞ ---------- */
 
 // --- KADEMELİ: oturum başlat (sayaçları 0'a çek) ---
@@ -922,9 +912,6 @@ app.post("/api/ladder/session/start", async (req, res) => {
   }
 });
 
-
-
-
 app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
@@ -935,22 +922,21 @@ app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
     }
 
     const rows = await all(
-  `
-  SELECT q.id, q.survey_id, q.question, q.point
-    FROM questions q
-    INNER JOIN surveys s ON s.id = q.survey_id
-   WHERE s.status = 'approved'
-     AND q.point = $2
-     AND q.id NOT IN (
-       SELECT a.question_id FROM answers a
-        WHERE a.user_id = $1 AND a.is_correct = 1
-     )
-   ORDER BY RANDOM()
-   LIMIT $3
-  `,
-  [userId, point, limit]
-);
-
+      `
+      SELECT q.id, q.survey_id, q.question, q.point
+        FROM questions q
+        INNER JOIN surveys s ON s.id = q.survey_id
+       WHERE s.status = 'approved'
+         AND q.point = $2
+         AND q.id NOT IN (
+           SELECT a.question_id FROM answers a
+            WHERE a.user_id = $1 AND a.is_correct = 1
+         )
+       ORDER BY md5($1::text || '-' || q.id::text)
+       LIMIT $3
+      `,
+      [userId, point, limit]
+    );
 
     res.json({ success: true, questions: rows });
   } catch (e) {
@@ -967,35 +953,52 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
       return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
     }
 
-    // ⬇️ Sadece AKTİF OTURUM (ladder_sessions) değerleri
+    // Yalnızca user_id ile oku; seviye eşleşmiyorsa 409
     const st = await get(
-  `SELECT attempts, correct
-     FROM ladder_sessions
-    WHERE user_id = $1 AND current_level = $2`,
-  [userId, point]
-);
+      `SELECT current_level, attempts, correct
+         FROM ladder_sessions
+        WHERE user_id = $1`,
+      [userId]
+    );
 
-const attempts = Number(st?.attempts || 0);
-const correct  = Number(st?.correct  || 0);
-const success_rate = attempts > 0 ? (correct / attempts) : 0;
+    if (!st) {
+      return res.json({
+        success: true,
+        point,
+        status: "no-session",
+        attempted: 0,
+        correct: 0,
+        success_rate: 0,
+        can_level_up: false
+      });
+    }
 
-return res.json({
-  success: true,
-  point,
-  attempted: attempts, // FE eski alan adını bekliyorsa bu isimle dönmeye devam et
-  correct,
-  success_rate,
-  can_level_up: (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE)
-});
+    if (Number(st.current_level) !== Number(point)) {
+      return res.status(409).json({
+        error: "Seviye uyumsuz. Aktif oturum seviyesi farklı.",
+        current_level: Number(st.current_level),
+        requested_point: Number(point)
+      });
+    }
 
+    const attempts = Number(st.attempts || 0);
+    const correct  = Number(st.correct  || 0);
+    const success_rate = attempts > 0 ? (correct / attempts) : 0;
+
+    return res.json({
+      success: true,
+      point,
+      attempted: attempts, // FE eski alan adı
+      correct,
+      success_rate,
+      can_level_up: (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE)
+    });
 
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Kademeli ilerleme alınamadı" });
   }
 });
-
-
 
 app.get("/api/user/:userId/kademeli-next", async (req, res) => {
   try {
@@ -1005,24 +1008,44 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
       return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
     }
 
-    // ⬇️ YALNIZCA AKTİF OTURUM (ladder_sessions) ÜZERİNDEN HESAPLA
+    // Yalnızca user_id ile oku; seviye eşleşmiyorsa 409
     const st = await get(
-  `SELECT attempts, correct
-     FROM ladder_sessions
-    WHERE user_id = $1 AND current_level = $2`,
-  [userId, point]
-);
+      `SELECT current_level, attempts, correct
+         FROM ladder_sessions
+        WHERE user_id = $1`,
+      [userId]
+    );
 
-const attempts = Number(st?.attempts || 0);
-const correct  = Number(st?.correct  || 0);
-const success_rate = attempts > 0 ? (correct / attempts) : 0;
+    if (!st) {
+      const bestRow = await get(
+        `SELECT COALESCE(ladder_best_level,0)::int AS best FROM users WHERE id=$1`,
+        [userId]
+      );
+      return res.json({
+        success: true,
+        status: "no-session",
+        can_level_up: false,
+        next_point: point,
+        best_level: bestRow?.best || 0
+      });
+    }
 
-const ok = (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE);
+    if (Number(st.current_level) !== Number(point)) {
+      return res.status(409).json({
+        error: "Seviye uyumsuz. Aktif oturum seviyesi farklı.",
+        current_level: Number(st.current_level),
+        requested_point: Number(point)
+      });
+    }
 
+    const attempts = Number(st.attempts || 0);
+    const correct  = Number(st.correct  || 0);
+    const success_rate = attempts > 0 ? (correct / attempts) : 0;
+    const ok = (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE);
 
     if (ok) {
       const next = (point >= 10) ? 10 : (point + 1);
-      try { await bumpLadderBest(userId, next); } catch (e) { /* sessiz */ }
+      try { await bumpLadderBest(userId, next); } catch (_e) { /* sessiz */ }
 
       if (point >= 10) {
         return res.json({
@@ -1042,14 +1065,14 @@ const ok = (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_R
       });
     }
 
-    // Oturum yoksa veya şart sağlanmadıysa: kal
+    // Oturum var ama şart sağlanmadı: kal
     const bestRow = await get(
       `SELECT COALESCE(ladder_best_level,0)::int AS best FROM users WHERE id=$1`,
       [userId]
     );
     return res.json({
       success: true,
-      status: st ? "stay" : "no-session",
+      status: "stay",
       can_level_up: false,
       next_point: point,
       best_level: bestRow?.best || 0
@@ -1060,8 +1083,6 @@ const ok = (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_R
     res.status(500).json({ error: "Seviye kontrolü yapılamadı" });
   }
 });
-
-
 
 // --- KADEMELİ: oturumu başlat/sıfırla ---
 app.post("/api/ladder/start", async (req, res) => {
@@ -1088,7 +1109,6 @@ app.post("/api/ladder/start", async (req, res) => {
     return res.status(500).json({ error: "Kademeli oturum başlatılamadı" });
   }
 });
-
 
 // --- KADEMELİ: en iyi (erişilen) seviye: sadece oku ---
 app.get("/api/user/:userId/ladder-best-level", async (req, res) => {
@@ -1121,7 +1141,6 @@ app.post("/api/user/:userId/ladder-best-level", async (req, res) => {
     res.status(500).json({ error: "En iyi kademe yazılamadı: " + e.message });
   }
 });
-
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 async function getOrCreateDailySetIds(dayKey, size) {
@@ -1244,11 +1263,11 @@ app.get("/api/daily/status", async (req, res) => {
     }
 
     const q = await get(`
-  SELECT q.id, q.question, q.point, q.survey_id, s.title AS survey_title
-  FROM questions q
-  LEFT JOIN surveys s ON s.id = q.survey_id
-  WHERE q.id = $1
-`, [ids[idx]]);
+      SELECT q.id, q.question, q.point, q.survey_id, s.title AS survey_title
+        FROM questions q
+        LEFT JOIN surveys s ON s.id = q.survey_id
+       WHERE q.id = $1
+    `, [ids[idx]]);
 
     if (!q) return res.status(500).json({ error: "Soru setinde geçersiz id" });
 
@@ -1360,13 +1379,13 @@ app.post("/api/daily/answer", async (req, res) => {
     }
 
     return res.json({
-  success: true,
-  is_correct,
-  index: nextIndex,
-  finished: isFinished,
-  awarded_books,
-  bonus_points: bonusPoints
-});
+      success: true,
+      is_correct,
+      index: nextIndex,
+      finished: isFinished,
+      awarded_books,
+      bonus_points: bonusPoints
+    });
 
   } catch (e) {
     console.error(e);
@@ -1458,7 +1477,6 @@ app.post("/api/daily/skip", async (req, res) => {
     return res.status(500).json({ error: "Günlük skip kaydedilemedi" });
   }
 });
-
 
 /* ---------- LEADERBOARDS & STATS ---------- */
 app.get("/api/daily/leaderboard", async (req, res) => {
@@ -1586,6 +1604,11 @@ app.post("/api/books/spend", async (req, res) => {
 
 app.post("/api/daily/award-books", async (req, res) => {
   try {
+    // Basit secret kontrolü (manuel tetiklemeyi koru)
+    if (req.body?.secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ error: "Yetkisiz" });
+    }
+
     const targetDay = req.body?.day || await getYesterdayKey();
     if (!targetDay) return res.status(400).json({ error: "day belirlenemedi" });
 
