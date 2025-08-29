@@ -335,9 +335,10 @@ app.post("/api/register", async (req, res) => {
       [ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role]
     );
     const user = await get(
-      `SELECT id, ad, soyad, email, role, cinsiyet FROM users WHERE email=$1`,
-      [email]
-    );
+  `SELECT id, ad, soyad, email, role, cinsiyet, user_code FROM users WHERE email=$1`,
+  [email]
+);
+
     res.json({ success: true, user });
   } catch (err) {
     if (String(err.message).includes("duplicate key")) return res.status(400).json({ error: "Bu e-posta zaten kayıtlı." });
@@ -354,10 +355,11 @@ app.post("/api/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await get(
-      `SELECT id, ad, soyad, email, role, cinsiyet
-       FROM users WHERE email=$1 AND password=$2`,
-      [email, password]
-    );
+  `SELECT id, ad, soyad, email, role, cinsiyet, user_code
+   FROM users WHERE email=$1 AND password=$2`,
+  [email, password]
+);
+
     if (!user) return res.status(401).json({ error: "E-posta veya şifre yanlış." });
     res.json({ success: true, user });
   } catch {
@@ -502,6 +504,21 @@ app.get("/api/quotes/random", async (_req, res) => {
 });
 
 /* ---------- USER ---------- */
+
+// -- RO: user_code oku
+app.get("/api/user/:userId/user-code", async (req, res) => {
+  try {
+    const row = await get(
+      `SELECT user_code FROM users WHERE id=$1`,
+      [req.params.userId]
+    );
+    if (!row) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+    res.json({ success: true, user_code: row.user_code });
+  } catch (e) {
+    res.status(500).json({ error: "user_code alınamadı" });
+  }
+});
+
 // Onaylı kategoriler handler'ı: 3 route aynı fonksiyonu kullanır
 async function handleApprovedSurveys(req, res) {
   try {
