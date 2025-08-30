@@ -772,6 +772,15 @@ app.post("/api/duello/invite", async (req, res) => {
     // durumları tazele
     await expireOldInvites();
 
+// ... /api/duello/invite içinde, hasActiveMatch() kontrollerinden ÖNCE:
+await run(`
+  UPDATE duello_matches
+     SET state='finished', finished_at = timezone('Europe/Istanbul', now())
+   WHERE state = 'active'
+     AND current_index >= total_questions
+`);
+
+
     // tek aktif maç kuralı
     if (await hasActiveMatch(fromId)) return res.status(409).json({ error: "Gönderenin aktif düellosu var" });
     if (await hasActiveMatch(toId))   return res.status(409).json({ error: "Alıcının aktif düellosu var" });
