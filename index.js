@@ -45,6 +45,14 @@ async function all(sql, params = []) { const { rows } = await pool.query(sql, pa
 const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
 
+/* ---------- ENV (Düello) ---------- */
+// Idle kalan maçları kaç saniyede "abandoned" yapalım? (min 30, max 600)
+const DUELLO_IDLE_ABORT_SEC = Math.max(
+  30,
+  Math.min(600, parseInt(process.env.DUELLO_IDLE_ABORT_SEC || "90", 10))
+);
+
+
 /* ---------- HEALTH ---------- */
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.send("healthy"));
@@ -315,15 +323,243 @@ async function init() {
   await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_rank_day ON book_awards (rank, day_key)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_book_awards_user ON book_awards (user_id)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_ladder_sessions_user_level ON ladder_sessions (user_id, current_level)`);
+
+// === DUELLO SCHEMA ===
+
+// 1) MATCHES (önce ana tablo)
+await run(`
+  CREATE TABLE IF NOT EXISTS duello_matches (
+    id               BIGSERIAL PRIMARY KEY,
+    mode             TEXT    NOT NULL CHECK (mode IN ('info','speed')),
+    user_a_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_b_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT timezone('Europe/Istanbul', now()),
+    finished_at      TIMESTAMPTZ,
+    state            TEXT    NOT NULL DEFAULT 'active' CHECK (state IN ('active','finished','abandoned')),
+    total_questions  INTEGER NOT NULL DEFAULT 12,
+    current_index    INTEGER NOT NULL DEFAULT 0,
+    last_seen_a      TIMESTAMPTZ,
+    last_seen_b      TIMESTAMPTZ,
+    last_activity_at TIMESTAMPTZ,
+    abandoned_at     TIMESTAMPTZ,
+    ended_reason     TEXT,
+    CHECK (user_a_id <> user_b_id)
+  )
+`);
+
+// 2) INVITES
+await run(`
+  CREATE TABLE IF NOT EXISTS duello_invites (
+    id            BIGSERIAL PRIMARY KEY,
+    from_user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    to_user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    mode          TEXT    NOT NULL CHECK (mode IN ('info','speed')),
+    status        TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected','cancelled','expired')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT timezone('Europe/Istanbul', now()),
+    expire_at     TIMESTAMPTZ NOT NULL DEFAULT (timezone('Europe/Istanbul', now()) + interval '5 minutes'),
+    accepted_at   TIMESTAMPTZ,
+    rejected_at   TIMESTAMPTZ,
+    cancelled_at  TIMESTAMPTZ,
+    match_id      INTEGER  -- isteğe bağlı; FK yok
+  )
+`);
+
+// 3) MATCH_QUESTIONS (matches -> questions FK)
+await run(`
+  CREATE TABLE IF NOT EXISTS duello_match_questions (
+    match_id    INTEGER NOT NULL REFERENCES duello_matches(id) ON DELETE CASCADE,
+    pos         INTEGER NOT NULL,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    PRIMARY KEY (match_id, pos)
+  )
+`);
+
+// 4) ANSWERS (matches & questions FK)
+await run(`
+  CREATE TABLE IF NOT EXISTS duello_answers (
+    id                BIGSERIAL PRIMARY KEY,
+    match_id          INTEGER NOT NULL REFERENCES duello_matches(id) ON DELETE CASCADE,
+    question_id       INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    answer            TEXT    NOT NULL,
+    is_correct        INTEGER NOT NULL DEFAULT 0,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT timezone('Europe/Istanbul', now()),
+    max_time_seconds  INTEGER,
+    time_left_seconds INTEGER,
+    earned_seconds    INTEGER
+  )
+`);
+
+// 5) PROFILES
+await run(`
+  CREATE TABLE IF NOT EXISTS duello_profiles (
+    user_id         INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    ready           BOOLEAN NOT NULL DEFAULT FALSE,
+    visibility_mode TEXT    NOT NULL DEFAULT 'public' CHECK (visibility_mode IN ('public','friends','none')),
+    last_ready_at   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT timezone('Europe/Istanbul', now()),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT timezone('Europe/Istanbul', now())
+  )
+`);
+
+// --- DUELLO: Eski tablolar için güvenli migrasyonlar (kolon eklemeleri) ---
+await run(`
+  ALTER TABLE duello_matches
+    ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS state TEXT,
+    ADD COLUMN IF NOT EXISTS total_questions INTEGER,
+    ADD COLUMN IF NOT EXISTS current_index INTEGER,
+    ADD COLUMN IF NOT EXISTS last_seen_a TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_seen_b TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS ended_reason TEXT
+`);
+
+// --- DUELLO: Eski tablolar için güvenli migrasyonlar (kolon eklemeleri) ---
+await run(`
+  ALTER TABLE duello_matches
+    ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS state TEXT,
+    ADD COLUMN IF NOT EXISTS total_questions INTEGER,
+    ADD COLUMN IF NOT EXISTS current_index INTEGER,
+    ADD COLUMN IF NOT EXISTS last_seen_a TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_seen_b TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS ended_reason TEXT
+`);
+
+await run(`UPDATE duello_matches SET state = COALESCE(state,'active')`);
+await run(`ALTER TABLE duello_matches ALTER COLUMN state SET DEFAULT 'active'`);
+await run(`ALTER TABLE duello_matches ALTER COLUMN state SET NOT NULL`);
+
+await run(`UPDATE duello_matches SET total_questions = COALESCE(total_questions,12)`);
+await run(`ALTER TABLE duello_matches ALTER COLUMN total_questions SET DEFAULT 12`);
+await run(`ALTER TABLE duello_matches ALTER COLUMN total_questions SET NOT NULL`);
+
+await run(`UPDATE duello_matches SET current_index = COALESCE(current_index,0)`);
+await run(`ALTER TABLE duello_matches ALTER COLUMN current_index SET DEFAULT 0`);
+await run(`ALTER TABLE duello_matches ALTER COLUMN current_index SET NOT NULL`);
+
+await run(`
+  ALTER TABLE duello_invites
+    ADD COLUMN IF NOT EXISTS mode TEXT,
+    ADD COLUMN IF NOT EXISTS status TEXT,
+    ADD COLUMN IF NOT EXISTS expire_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS match_id INTEGER
+`);
+await run(`UPDATE duello_invites SET mode = COALESCE(mode,'info')`);
+await run(`UPDATE duello_invites SET status = COALESCE(status,'pending')`);
+await run(`UPDATE duello_invites SET expire_at = COALESCE(expire_at, timezone('Europe/Istanbul', now()) + interval '5 minutes')`);
+
+await run(`
+  ALTER TABLE duello_answers
+    ADD COLUMN IF NOT EXISTS max_time_seconds INTEGER,
+    ADD COLUMN IF NOT EXISTS time_left_seconds INTEGER,
+    ADD COLUMN IF NOT EXISTS earned_seconds INTEGER
+`);
+
+// --- DUELLO: CHECK constraint düzeltmeleri + veri normalizasyonu ---
+try {
+  // state değerlerini güvene al
+  await run(`UPDATE duello_matches
+               SET state = COALESCE(state,'active')
+             WHERE state IS NULL
+                OR state NOT IN ('active','finished','abandoned')`);
+
+  // mevcut "state" CHECK kısıtını kaldır ve yenisini ekle
+  await run(`ALTER TABLE duello_matches DROP CONSTRAINT IF EXISTS duello_matches_state_chk`);
+  await run(`ALTER TABLE duello_matches
+               ADD CONSTRAINT duello_matches_state_chk
+               CHECK (state IN ('active','finished','abandoned'))`);
+  await run(`ALTER TABLE duello_matches ALTER COLUMN state SET DEFAULT 'active'`);
+
+  // mode için de benzer güvenlik (eski şemalardan gelebilir)
+  await run(`UPDATE duello_matches
+               SET mode = CASE WHEN mode IN ('info','speed') THEN mode ELSE 'info' END`);
+  await run(`ALTER TABLE duello_matches DROP CONSTRAINT IF EXISTS duello_matches_mode_check`);
+  await run(`ALTER TABLE duello_matches DROP CONSTRAINT IF EXISTS duello_matches_mode_chk`);
+  await run(`ALTER TABLE duello_matches
+               ADD CONSTRAINT duello_matches_mode_chk
+               CHECK (mode IN ('info','speed'))`);
+} catch (e) {
+  console.error("duello_matches constraint fix:", e.message);
 }
+
+
+// --- Indexler ---
+await run(`
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_duello_invites_pending_pair
+    ON duello_invites (from_user_id, to_user_id)
+    WHERE status = 'pending'
+`);
+await run(`
+  CREATE INDEX IF NOT EXISTS idx_duello_invites_to_pending
+    ON duello_invites (to_user_id, status, expire_at DESC)
+`);
+await run(`
+  CREATE INDEX IF NOT EXISTS idx_duello_invites_from_pending
+    ON duello_invites (from_user_id, status, expire_at DESC)
+`);
+await run(`
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_duello_answers_once
+    ON duello_answers (match_id, question_id, user_id)
+`);
+await run(`
+  CREATE INDEX IF NOT EXISTS idx_duello_answers_q
+    ON duello_answers (match_id, question_id)
+`);
+await run(`
+  CREATE INDEX IF NOT EXISTS idx_duello_answers_u
+    ON duello_answers (match_id, user_id)
+`);
+await run(`CREATE INDEX IF NOT EXISTS idx_duello_active_a   ON duello_matches (user_a_id) WHERE state='active'`);
+await run(`CREATE INDEX IF NOT EXISTS idx_duello_active_b   ON duello_matches (user_b_id) WHERE state='active'`);
+await run(`CREATE INDEX IF NOT EXISTS idx_duello_active_last ON duello_matches (state, last_activity_at)`);
+
+}
+
+
 
 init()
   .then(() => {
     console.log("PostgreSQL tablolar hazır");
     awardSchedulerTick();
     setInterval(awardSchedulerTick, 5 * 60 * 1000);
+       // Düello: idle/abandon süpürücü (her 30 sn’de bir)
+    const idleSweepMs = 30 * 1000;
+    duelloIdleAbortTick();               // bir defa hemen çalıştır
+    setInterval(duelloIdleAbortTick, idleSweepMs);
+
   })
   .catch(e => { console.error(e); process.exit(1); });
+
+// --- DUELLO: idle-timeout yardımcı fonksiyon (şimdilik sadece tanımlı) ---
+async function duelloIdleAbortTick() {
+  try {
+    const sec = DUELLO_IDLE_ABORT_SEC; // sonraki adımda env/varsayılan ekleyeceğiz
+    await run(`
+      UPDATE duello_matches
+         SET state='abandoned',
+             ended_reason='idle_timeout',
+             finished_at = timezone('Europe/Istanbul', now()),
+             abandoned_at = timezone('Europe/Istanbul', now())
+       WHERE state='active'
+         AND (
+              COALESCE(last_seen_a, TIMESTAMP 'epoch') < timezone('Europe/Istanbul', now()) - interval '${sec} seconds'
+           OR COALESCE(last_seen_b, TIMESTAMP 'epoch') < timezone('Europe/Istanbul', now()) - interval '${sec} seconds'
+         )
+         AND current_index < total_questions
+    `);
+  } catch (e) {
+    console.error("duelloIdleAbortTick hata:", e.message);
+  }
+}
+
 
 /* ---------- AUTH ---------- */
 app.post("/api/register", async (req, res) => {
@@ -869,9 +1105,14 @@ app.post("/api/duello/invite/respond", async (req, res) => {
     // maçı yarat (24 soru hedefi, soru setini bir sonraki adımda ekleyeceğiz)
     const match = await get(
       `INSERT INTO duello_matches
-         (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index)
-       VALUES ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0)
-       RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
+  (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
+   last_seen_a, last_seen_b, last_activity_at)
+VALUES
+  ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0,
+   timezone('Europe/Istanbul', now()),
+   timezone('Europe/Istanbul', now()),
+   timezone('Europe/Istanbul', now()))
+RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
       [inv.mode, fromId, toId]
     );
 
@@ -1132,6 +1373,16 @@ app.get("/api/duello/match/:matchId/status", async (req, res) => {
     if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
     if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
 
+await run(
+  `UPDATE duello_matches
+      SET last_activity_at = COALESCE(last_activity_at, timezone('Europe/Istanbul', now())),
+          last_seen_a = CASE WHEN user_a_id=$2 THEN timezone('Europe/Istanbul', now()) ELSE last_seen_a END,
+          last_seen_b = CASE WHEN user_b_id=$2 THEN timezone('Europe/Istanbul', now()) ELSE last_seen_b END
+    WHERE id=$1`,
+  [matchId, userId]
+);
+
+
     // Soru setini garantiye al
     const set = await ensureDuelloQuestionSet(m);
 
@@ -1221,6 +1472,17 @@ app.post("/api/duello/match/:matchId/answer", async (req, res) => {
     if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
     if (m.state !== "active") return res.status(409).json({ error: "Maç aktif değil" });
     if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
+
+await run(
+  `UPDATE duello_matches
+      SET last_activity_at = timezone('Europe/Istanbul', now()),
+          last_seen_a = CASE WHEN user_a_id=$2 THEN timezone('Europe/Istanbul', now()) ELSE last_seen_a END,
+          last_seen_b = CASE WHEN user_b_id=$2 THEN timezone('Europe/Istanbul', now()) ELSE last_seen_b END
+    WHERE id=$1`,
+  [matchId, userId]
+);
+
+
 
     // Aktif soru
     const currentPos = Number(m.current_index) + 1;
@@ -1321,6 +1583,16 @@ app.post("/api/duello/match/:matchId/reveal", async (req, res) => {
       return res.json({ success: true, finished: true, current_index: Number(m.current_index) });
     }
     if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
+
+await run(
+  `UPDATE duello_matches
+      SET last_activity_at = timezone('Europe/Istanbul', now()),
+          last_seen_a = CASE WHEN user_a_id=$2 THEN timezone('Europe/Istanbul', now()) ELSE last_seen_a END,
+          last_seen_b = CASE WHEN user_b_id=$2 THEN timezone('Europe/Istanbul', now()) ELSE last_seen_b END
+    WHERE id=$1`,
+  [matchId, userId]
+);
+
 
     const total = Number(m.total_questions);
     const currentPos = Number(m.current_index) + 1;
