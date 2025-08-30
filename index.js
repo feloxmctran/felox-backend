@@ -870,7 +870,7 @@ app.post("/api/duello/invite/respond", async (req, res) => {
     const match = await get(
       `INSERT INTO duello_matches
          (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index)
-       VALUES ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 24, 0)
+       VALUES ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0)
        RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
       [inv.mode, fromId, toId]
     );
@@ -1039,7 +1039,7 @@ async function ensureDuelloQuestionSet(match) {
   );
   if (existing.length > 0) return existing;
 
-  const total = Math.max(1, Number(match.total_questions) || 24);
+  const total = Math.max(1, Number(match.total_questions) || 12);
 
   // Onaylı havuzdan deterministik rastgele
   const rows = await all(
@@ -1193,7 +1193,7 @@ app.get("/api/duello/match/:matchId/status", async (req, res) => {
       question: { pos: currentPos, ...q },
       answers: { mine: myAns, opponent: oppAns },
       scores,
-      ui: { per_question_seconds: 24, reveal_seconds: 3 }
+      ui: { per_question_seconds: 16, reveal_seconds: 3 }
     });
   } catch (e) {
     res.status(500).json({ error: "Maç durumu alınamadı: " + e.message });
@@ -1249,7 +1249,7 @@ app.post("/api/duello/match/:matchId/answer", async (req, res) => {
     const isCorrect = qc?.correct_answer === norm ? 1 : 0;
 
     // Zaman alanları
-    const maxSec = Number.isFinite(mls) ? Math.max(1, Math.min(120, Math.round(mls))) : 24;
+    const maxSec = Number.isFinite(mls) ? Math.max(1, Math.min(120, Math.round(mls))) : 16;
     const leftRaw = Number.isFinite(tls) ? Math.round(tls) : 0;
     const leftSec = Math.max(0, Math.min(leftRaw, maxSec));
 
@@ -1347,7 +1347,7 @@ app.post("/api/duello/match/:matchId/reveal", async (req, res) => {
         [matchId, qid, bId]
       );
 
-      const maxSec = 24;
+      const maxSec = 16;
       if (!aAns) {
         await run(
           `INSERT INTO duello_answers
