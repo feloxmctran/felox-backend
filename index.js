@@ -596,6 +596,778 @@ app.get("/api/debug/whoami", async (_req, res) => {
   }
 });
 
+
+/* ---------- DUELLO PROFILE (ready + visibility) ---------- */
+
+/** duello_profiles kaydı yoksa oluşturur ve döner */
+async function ensureDuelloProfile(userId) {
+  await run(
+    `INSERT INTO duello_profiles (user_id)
+     VALUES ($1)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [userId]
+  );
+  return await get(
+    `SELECT user_id, ready, visibility_mode, last_ready_at
+       FROM duello_profiles
+      WHERE user_id = $1`,
+    [userId]
+  );
+}
+
+/** Profili getir (yoksa oluştur) */
+app.get("/api/duello/profile/:userId", async (req, res) => {
+  try {
+    const uid = Number(req.params.userId);
+    if (!uid) return res.status(400).json({ error: "Geçersiz userId" });
+
+    // kullanıcı var mı?
+    const u = await get(`SELECT id FROM users WHERE id=$1`, [uid]);
+    if (!u) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+
+    const prof = await ensureDuelloProfile(uid);
+    return res.json({ success: true, profile: prof });
+  } catch (e) {
+    res.status(500).json({ error: "Düello profili alınamadı: " + e.message });
+  }
+});
+
+/** Hazırım anahtarı: true/false */
+app.post("/api/duello/ready", async (req, res) => {
+  try {
+    const uid = Number(req.body?.user_id);
+    const ready = req.body?.ready === true || String(req.body?.ready) === "true";
+    if (!uid) return res.status(400).json({ error: "user_id zorunlu" });
+
+    // kullanıcı doğrula
+    const u = await get(`SELECT id FROM users WHERE id=$1`, [uid]);
+    if (!u) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+
+    await ensureDuelloProfile(uid);
+
+    const row = await get(
+      `UPDATE duello_profiles
+          SET ready = $2,
+              last_ready_at = CASE WHEN $2 THEN timezone('Europe/Istanbul', now())
+                                   ELSE last_ready_at END
+        WHERE user_id = $1
+      RETURNING user_id, ready, visibility_mode, last_ready_at`,
+      [uid, ready]
+    );
+
+    return res.json({ success: true, profile: row });
+  } catch (e) {
+    res.status(500).json({ error: "Hazır durumu güncellenemedi: " + e.message });
+  }
+});
+
+/** Görünürlük: public | friends | none */
+app.post("/api/duello/visibility", async (req, res) => {
+  try {
+    const uid = Number(req.body?.user_id);
+    const mode = String(req.body?.visibility_mode || "").toLowerCase();
+    if (!uid) return res.status(400).json({ error: "user_id zorunlu" });
+    if (!["public", "friends", "none"].includes(mode)) {
+      return res.status(400).json({ error: "visibility_mode public|friends|none olmalı" });
+    }
+
+    const u = await get(`SELECT id FROM users WHERE id=$1`, [uid]);
+    if (!u) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+
+    await ensureDuelloProfile(uid);
+
+    const row = await get(
+      `UPDATE duello_profiles
+          SET visibility_mode = $2
+        WHERE user_id = $1
+      RETURNING user_id, ready, visibility_mode, last_ready_at`,
+      [uid, mode]
+    );
+
+    return res.json({ success: true, profile: row });
+  } catch (e) {
+    res.status(500).json({ error: "Görünürlük güncellenemedi: " + e.message });
+  }
+});
+
+/* ---------- DUELLO INVITES (create/respond/cancel + inbox/outbox) ---------- */
+
+/** PENDING -> EXPIRED temizlik */
+async function expireOldInvites() {
+  await run(
+    `UPDATE duello_invites
+        SET status='expired'
+      WHERE status='pending'
+        AND expire_at <= timezone('Europe/Istanbul', now())`
+  );
+}
+
+/** Kullanıcının aktif maçı var mı? (tek aktif maç kuralı) */
+async function hasActiveMatch(userId) {
+  const row = await get(
+    `SELECT 1
+       FROM duello_matches
+      WHERE state = 'active'
+        AND (user_a_id = $1 OR user_b_id = $1)
+      LIMIT 1`,
+    [userId]
+  );
+  return !!row;
+}
+
+/** İki kullanıcı arasında açık (süresi dolmamış) davet var mı? */
+async function hasFreshPendingInvite(a, b) {
+  const row = await get(
+    `SELECT 1
+       FROM duello_invites
+      WHERE status='pending'
+        AND expire_at > timezone('Europe/Istanbul', now())
+        AND (
+          (from_user_id=$1 AND to_user_id=$2) OR
+          (from_user_id=$2 AND to_user_id=$1)
+        )
+      LIMIT 1`,
+    [a, b]
+  );
+  return !!row;
+}
+
+/** Kullanıcı kodundan kullanıcıyı bulur */
+async function findUserByIdOrCode({ user_id, user_code }) {
+  if (user_id) {
+    return await get(`SELECT id, ad, soyad, user_code FROM users WHERE id=$1`, [user_id]);
+  }
+  if (user_code) {
+    const code = String(user_code).trim().toUpperCase();
+    return await get(
+      `SELECT id, ad, soyad, user_code FROM users WHERE user_code = $1`,
+      [code]
+    );
+  }
+  return null;
+}
+
+/**
+ * Davet oluştur (doğrudan user_code ile).
+ * Kural: Tek aktif maç — hem gönderenin hem alıcının aktif maçı olmamalı.
+ * Not: Alıcı 'ready=OFF' olsa bile user_code ile doğrudan davet GİDER (kuralınız).
+ */
+app.post("/api/duello/invite", async (req, res) => {
+  try {
+    const fromId = Number(req.body?.from_user_id);
+    const mode   = String(req.body?.mode || "info").toLowerCase(); // 'info' | 'speed'
+    const toUser = await findUserByIdOrCode({
+      user_id: req.body?.to_user_id,
+      user_code: req.body?.to_user_code
+    });
+
+    if (!fromId) return res.status(400).json({ error: "from_user_id zorunlu" });
+    if (!toUser) return res.status(404).json({ error: "Hedef kullanıcı bulunamadı" });
+    if (!["info", "speed"].includes(mode))
+      return res.status(400).json({ error: "mode 'info' veya 'speed' olmalı" });
+
+    const toId = Number(toUser.id);
+    if (fromId === toId) return res.status(400).json({ error: "Kendinize davet gönderemezsiniz" });
+
+    // durumları tazele
+    await expireOldInvites();
+
+    // tek aktif maç kuralı
+    if (await hasActiveMatch(fromId)) return res.status(409).json({ error: "Gönderenin aktif düellosu var" });
+    if (await hasActiveMatch(toId))   return res.status(409).json({ error: "Alıcının aktif düellosu var" });
+
+    // tekrar eden açık davet engeli
+    if (await hasFreshPendingInvite(fromId, toId)) {
+      return res.status(409).json({ error: "Zaten açık bir davet var" });
+    }
+
+    // 5 dk geçerli
+    const inv = await get(
+      `INSERT INTO duello_invites
+         (from_user_id, to_user_id, mode, created_at, expire_at, status)
+       VALUES ($1,$2,$3, timezone('Europe/Istanbul', now()),
+               timezone('Europe/Istanbul', now()) + interval '5 minutes',
+               'pending')
+       RETURNING id, from_user_id, to_user_id, mode, expire_at`,
+      [fromId, toId, mode]
+    );
+
+    return res.json({ success: true, invite: inv });
+  } catch (e) {
+    res.status(500).json({ error: "Davet oluşturulamadı: " + e.message });
+  }
+});
+
+/**
+ * Daveti cevapla: accept | reject
+ * - Yalnızca alıcı (to_user_id) yanıtlayabilir
+ * - Süresi geçmiş ya da yanıtlanmış davet reddedilir
+ * - Kabulde tek aktif maç kuralı yeniden kontrol
+ * - Kabulde duello_matches kaydı oluşturulur (soru seti bir sonraki adımda)
+ */
+app.post("/api/duello/invite/respond", async (req, res) => {
+  try {
+    const inviteId = Number(req.body?.invite_id);
+    const userId   = Number(req.body?.user_id);
+    const action   = String(req.body?.action || "").toLowerCase(); // 'accept' | 'reject'
+    if (!inviteId || !userId) return res.status(400).json({ error: "invite_id ve user_id zorunlu" });
+    if (!["accept", "reject"].includes(action))
+      return res.status(400).json({ error: "action 'accept' veya 'reject' olmalı" });
+
+    await expireOldInvites();
+
+    const inv = await get(
+      `SELECT *
+         FROM duello_invites
+        WHERE id=$1`,
+      [inviteId]
+    );
+    if (!inv) return res.status(404).json({ error: "Davet bulunamadı" });
+    if (Number(inv.to_user_id) !== userId) return res.status(403).json({ error: "Bu daveti yanıtlama yetkiniz yok" });
+    if (inv.status !== "pending") return res.status(409).json({ error: "Davet artık pending değil" });
+
+    // süresi geçti mi?
+    const expired = await get(
+      `SELECT (expire_at <= timezone('Europe/Istanbul', now())) AS exp FROM duello_invites WHERE id=$1`,
+      [inviteId]
+    );
+    if (expired?.exp) {
+      await run(`UPDATE duello_invites SET status='expired' WHERE id=$1`, [inviteId]);
+      return res.status(410).json({ error: "Davetin süresi dolmuş" });
+    }
+
+    if (action === "reject") {
+      const row = await get(
+        `UPDATE duello_invites
+            SET status='rejected', rejected_at=timezone('Europe/Istanbul', now())
+          WHERE id=$1
+        RETURNING id, status, rejected_at`,
+        [inviteId]
+      );
+      return res.json({ success: true, invite: row });
+    }
+
+    // ACCEPT
+    const fromId = Number(inv.from_user_id);
+    const toId   = Number(inv.to_user_id);
+
+    // tek aktif maç kontrolü (son kez)
+    if (await hasActiveMatch(fromId)) return res.status(409).json({ error: "Gönderenin aktif düellosu var" });
+    if (await hasActiveMatch(toId))   return res.status(409).json({ error: "Alıcının aktif düellosu var" });
+
+    // maçı yarat (24 soru hedefi, soru setini bir sonraki adımda ekleyeceğiz)
+    const match = await get(
+      `INSERT INTO duello_matches
+         (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index)
+       VALUES ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 24, 0)
+       RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
+      [inv.mode, fromId, toId]
+    );
+
+    // daveti accepted yap + mümkünse match_id bağla (kolon yoksa dene/boşver)
+    const acc = await get(
+      `UPDATE duello_invites
+          SET status='accepted',
+              accepted_at=timezone('Europe/Istanbul', now())
+        WHERE id=$1
+      RETURNING id, status, accepted_at`,
+      [inviteId]
+    );
+    // match_id kolonu varsa yaz, yoksa yut
+    try {
+      await run(`UPDATE duello_invites SET match_id=$2 WHERE id=$1`, [inviteId, match.id]);
+    } catch (_) {}
+
+    // Tarafların diğer pending davetlerini iptal et (isteğe bağlı güvenlik)
+    await run(
+      `UPDATE duello_invites
+          SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
+        WHERE status='pending'
+          AND expire_at > timezone('Europe/Istanbul', now())
+          AND id <> $1
+          AND (from_user_id IN ($2,$3) OR to_user_id IN ($2,$3))`,
+      [inviteId, fromId, toId]
+    );
+
+    return res.json({ success: true, invite: acc, match });
+  } catch (e) {
+    res.status(500).json({ error: "Davet yanıtlanamadı: " + e.message });
+  }
+});
+
+/** Gönderen tarafından daveti iptal et (pending iken) */
+app.post("/api/duello/invite/cancel", async (req, res) => {
+  try {
+    const inviteId = Number(req.body?.invite_id);
+    const userId   = Number(req.body?.user_id);
+    if (!inviteId || !userId) return res.status(400).json({ error: "invite_id ve user_id zorunlu" });
+
+    await expireOldInvites();
+
+    const inv = await get(`SELECT * FROM duello_invites WHERE id=$1`, [inviteId]);
+    if (!inv) return res.status(404).json({ error: "Davet bulunamadı" });
+    if (Number(inv.from_user_id) !== userId) return res.status(403).json({ error: "Yalnızca gönderen iptal edebilir" });
+    if (inv.status !== "pending") return res.status(409).json({ error: "Bu davet pending değil" });
+
+    const row = await get(
+      `UPDATE duello_invites
+          SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
+        WHERE id=$1
+      RETURNING id, status, cancelled_at`,
+      [inviteId]
+    );
+    return res.json({ success: true, invite: row });
+  } catch (e) {
+    res.status(500).json({ error: "Davet iptal edilemedi: " + e.message });
+  }
+});
+
+/** Gelen kutusu: pending ve süresi geçmemiş davetler */
+app.get("/api/duello/inbox/:userId", async (req, res) => {
+  try {
+    const uid = Number(req.params.userId);
+    await expireOldInvites();
+    const rows = await all(
+      `SELECT i.id, i.from_user_id, i.to_user_id, i.mode, i.created_at, i.expire_at, i.status,
+              u.ad AS from_ad, u.soyad AS from_soyad, u.user_code AS from_user_code
+         FROM duello_invites i
+         JOIN users u ON u.id = i.from_user_id
+        WHERE i.to_user_id = $1
+          AND i.status = 'pending'
+          AND i.expire_at > timezone('Europe/Istanbul', now())
+        ORDER BY i.created_at DESC`,
+      [uid]
+    );
+    res.json({ success: true, invites: rows });
+  } catch (e) {
+    res.status(500).json({ error: "Gelen davetler alınamadı: " + e.message });
+  }
+});
+
+/** Giden kutusu: pending ve süresi geçmemiş davetler */
+app.get("/api/duello/outbox/:userId", async (req, res) => {
+  try {
+    const uid = Number(req.params.userId);
+    await expireOldInvites();
+    const rows = await all(
+      `SELECT i.id, i.from_user_id, i.to_user_id, i.mode, i.created_at, i.expire_at, i.status,
+              u.ad AS to_ad, u.soyad AS to_soyad, u.user_code AS to_user_code
+         FROM duello_invites i
+         JOIN users u ON u.id = i.to_user_id
+        WHERE i.from_user_id = $1
+          AND i.status = 'pending'
+          AND i.expire_at > timezone('Europe/Istanbul', now())
+        ORDER BY i.created_at DESC`,
+      [uid]
+    );
+    res.json({ success: true, invites: rows });
+  } catch (e) {
+    res.status(500).json({ error: "Giden davetler alınamadı: " + e.message });
+  }
+});
+
+
+/* ---------- DUELLO MATCH: status / answer / reveal ---------- */
+
+/* ——— Helpers ——— */
+
+/** Maçı oku */
+async function duelloGetMatch(matchId) {
+  return await get(`SELECT * FROM duello_matches WHERE id=$1`, [matchId]);
+}
+
+/** Kullanıcı maçta mı? */
+function inThisMatch(m, uid) {
+  return Number(m.user_a_id) === Number(uid) || Number(m.user_b_id) === Number(uid);
+}
+
+/** Rakibi bul */
+function opponentId(m, uid) {
+  return Number(m.user_a_id) === Number(uid) ? Number(m.user_b_id) : Number(m.user_a_id);
+}
+
+/** Pos -> question_id getir */
+async function duelloGetQuestionIdByPos(matchId, pos) {
+  const row = await get(
+    `SELECT question_id FROM duello_match_questions WHERE match_id=$1 AND pos=$2`,
+    [matchId, pos]
+  );
+  return row?.question_id || null;
+}
+
+/** Soru setini üret (yoksa) */
+async function ensureDuelloQuestionSet(match) {
+  const existing = await all(
+    `SELECT pos, question_id
+       FROM duello_match_questions
+      WHERE match_id=$1
+      ORDER BY pos ASC`,
+    [match.id]
+  );
+  if (existing.length > 0) return existing;
+
+  const total = Math.max(1, Number(match.total_questions) || 24);
+
+  // Onaylı havuzdan deterministik rastgele
+  const rows = await all(
+    `
+    SELECT q.id
+      FROM questions q
+      JOIN surveys s ON s.id = q.survey_id
+     WHERE s.status='approved'
+     ORDER BY md5($1::text || '-' || q.id::text)
+     LIMIT $2
+    `,
+    [String(match.id), total]
+  );
+
+  const ids = rows.map(r => r.id);
+  for (let i = 0; i < ids.length; i++) {
+    await run(
+      `INSERT INTO duello_match_questions (match_id, pos, question_id)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (match_id, pos) DO NOTHING`,
+      [match.id, i + 1, ids[i]]
+    );
+  }
+  return await all(
+    `SELECT pos, question_id FROM duello_match_questions WHERE match_id=$1 ORDER BY pos ASC`,
+    [match.id]
+  );
+}
+
+/** Bu soruya verilen cevap(lar) */
+async function duelloGetAnswers(matchId, questionId) {
+  return await all(
+    `SELECT user_id, answer, is_correct, max_time_seconds, time_left_seconds
+       FROM duello_answers
+      WHERE match_id=$1 AND question_id=$2`,
+    [matchId, questionId]
+  );
+}
+
+/** Skorları hesapla (toplam) */
+async function duelloScores(matchId, aId, bId) {
+  const row = await get(
+    `
+    SELECT
+      COALESCE(SUM(
+        CASE WHEN da.user_id = $2 THEN
+          CASE WHEN da.answer='bilmem' THEN 0
+               WHEN da.is_correct=1       THEN q.point
+               ELSE -q.point END
+        ELSE 0 END
+      ),0)::int AS score_a,
+      COALESCE(SUM(
+        CASE WHEN da.user_id = $3 THEN
+          CASE WHEN da.answer='bilmem' THEN 0
+               WHEN da.is_correct=1       THEN q.point
+               ELSE -q.point END
+        ELSE 0 END
+      ),0)::int AS score_b
+    FROM duello_answers da
+    JOIN questions q ON q.id = da.question_id
+    WHERE da.match_id = $1
+    `,
+    [matchId, aId, bId]
+  );
+  return { score_a: row?.score_a || 0, score_b: row?.score_b || 0 };
+}
+
+/** Cevabı normalize et (bilgi+hız modunda kullanıcıdan 'bilmem' kabul etmeyeceğiz) */
+function normalizeDuelloAnswer(mode, raw) {
+  const s = normalizeAnswer(raw);
+  if (mode === "speed" && s === "bilmem") {
+    // kullanıcıdan gelen bilmem yok; sistem gerektiğinde otomatik atar
+    return null;
+  }
+  return s;
+}
+
+/* ——— STATUS ——— */
+/**
+ * Maç durumunu döner: soru seti, aktif soru, verilen cevaplar, skorlar.
+ * FE: 24 sn sayaç sizde; server zaman saymıyor.
+ */
+app.get("/api/duello/match/:matchId/status", async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const userId  = Number(req.query.user_id);
+    if (!matchId || !userId) return res.status(400).json({ error: "matchId ve user_id zorunlu" });
+
+    const m = await duelloGetMatch(matchId);
+    if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
+    if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
+
+    // Soru setini garantiye al
+    const set = await ensureDuelloQuestionSet(m);
+
+    // Skorlar
+    const aId = Number(m.user_a_id), bId = Number(m.user_b_id);
+    const scores = await duelloScores(matchId, aId, bId);
+
+    // Bitmiş mi?
+    if (m.state === "finished" || Number(m.current_index) >= Number(m.total_questions)) {
+      const finished = {
+        success: true,
+        finished: true,
+        match: {
+          id: m.id, mode: m.mode, total_questions: m.total_questions,
+          user_a_id: aId, user_b_id: bId, state: "finished"
+        },
+        scores
+      };
+      return res.json(finished);
+    }
+
+    const currentPos = Number(m.current_index) + 1;
+    const qid = await duelloGetQuestionIdByPos(m.id, currentPos);
+    if (!qid) {
+      return res.json({
+        success: true,
+        finished: true,
+        match: { id: m.id, mode: m.mode, total_questions: m.total_questions, state: "finished" },
+        scores
+      });
+    }
+
+    const q = await get(
+      `SELECT q.id, q.question, q.point, q.survey_id, s.title AS survey_title
+         FROM questions q
+         LEFT JOIN surveys s ON s.id = q.survey_id
+        WHERE q.id=$1`,
+      [qid]
+    );
+
+    const ans = await duelloGetAnswers(m.id, qid);
+    const myAns  = ans.find(a => Number(a.user_id) === userId) || null;
+    const oppAns = ans.find(a => Number(a.user_id) === opponentId(m, userId)) || null;
+
+    const me  = await get(`SELECT id, ad, soyad, user_code FROM users WHERE id=$1`, [userId]);
+    const opp = await get(`SELECT id, ad, soyad, user_code FROM users WHERE id=$1`, [opponentId(m, userId)]);
+
+    return res.json({
+      success: true,
+      finished: false,
+      match: {
+        id: m.id, mode: m.mode, state: m.state,
+        total_questions: Number(m.total_questions),
+        current_index: Number(m.current_index),
+        user_a_id: aId, user_b_id: bId
+      },
+      you: me,
+      opponent: opp,
+      question: { pos: currentPos, ...q },
+      answers: { mine: myAns, opponent: oppAns },
+      scores,
+      ui: { per_question_seconds: 24, reveal_seconds: 3 }
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Maç durumu alınamadı: " + e.message });
+  }
+});
+
+/* ——— ANSWER ——— */
+/**
+ * Cevabı kaydeder.
+ * - Bilgi modunda iki taraf da 24 sn içinde cevap verebilir (bilmem serbest).
+ * - Hız modunda ilk gelen cevap soruyu KİLİTLER; rakibe sistem 'bilmem' yazar.
+ * Skor güncellemesi ve ilerletme REVEAL ile yapılır (idempotent).
+ */
+app.post("/api/duello/match/:matchId/answer", async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const userId  = Number(req.body?.user_id);
+    const answer  = req.body?.answer;
+    const tls     = Number(req.body?.time_left_seconds);
+    const mls     = Number(req.body?.max_time_seconds);
+
+    if (!matchId || !userId) return res.status(400).json({ error: "matchId ve user_id zorunlu" });
+
+    const m = await duelloGetMatch(matchId);
+    if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
+    if (m.state !== "active") return res.status(409).json({ error: "Maç aktif değil" });
+    if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
+
+    // Aktif soru
+    const currentPos = Number(m.current_index) + 1;
+    const qid = await duelloGetQuestionIdByPos(m.id, currentPos);
+    if (!qid) return res.status(400).json({ error: "Aktif soru yok" });
+
+    // Cevabı normalize et
+    const norm = normalizeDuelloAnswer(String(m.mode), answer);
+    if (norm == null) return res.status(400).json({ error: "Hız modunda 'bilmem' seçeneği yok" });
+
+    // Zaten cevap vermiş mi?
+    const myPrev = await get(
+      `SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2 AND user_id=$3`,
+      [matchId, qid, userId]
+    );
+    if (myPrev) return res.status(409).json({ error: "Bu soruya zaten cevap verdiniz" });
+
+    // Hız modunda ilk gelen kazanır: önce başka bir cevap var mı?
+    const prev = await all(
+      `SELECT user_id FROM duello_answers WHERE match_id=$1 AND question_id=$2`,
+      [matchId, qid]
+    );
+
+    // Doğruluk
+    const qc = await get(`SELECT correct_answer FROM questions WHERE id=$1`, [qid]);
+    const isCorrect = qc?.correct_answer === norm ? 1 : 0;
+
+    // Zaman alanları
+    const maxSec = Number.isFinite(mls) ? Math.max(1, Math.min(120, Math.round(mls))) : 24;
+    const leftRaw = Number.isFinite(tls) ? Math.round(tls) : 0;
+    const leftSec = Math.max(0, Math.min(leftRaw, maxSec));
+
+    if (String(m.mode) === "speed") {
+      if (prev.length > 0) {
+        // Çoktan kilitlendi; kullanıcıdan geleni reddet
+        return res.status(409).json({ error: "Soru kilitlendi (hız modu)" });
+      }
+      // 1) Benim cevabım
+      await run(
+        `INSERT INTO duello_answers
+           (match_id, question_id, user_id, answer, is_correct, created_at,
+            max_time_seconds, time_left_seconds, earned_seconds)
+         VALUES ($1,$2,$3,$4,$5, timezone('Europe/Istanbul', now()),
+                 $6,$7,$7)`,
+        [matchId, qid, userId, norm, isCorrect, maxSec, leftSec]
+      );
+      // 2) Rakibe anında 'bilmem'
+      const oppId = opponentId(m, userId);
+      const oppPrev = await get(
+        `SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2 AND user_id=$3`,
+        [matchId, qid, oppId]
+      );
+      if (!oppPrev) {
+        await run(
+          `INSERT INTO duello_answers
+             (match_id, question_id, user_id, answer, is_correct, created_at,
+              max_time_seconds, time_left_seconds, earned_seconds)
+           VALUES ($1,$2,$3,'bilmem',0, timezone('Europe/Istanbul', now()), $4,0,0)`,
+          [matchId, qid, oppId, maxSec]
+        );
+      }
+      return res.json({ success: true, locked: true });
+    }
+
+    // bilgi modu: serbest, sadece kaydet
+    await run(
+      `INSERT INTO duello_answers
+         (match_id, question_id, user_id, answer, is_correct, created_at,
+          max_time_seconds, time_left_seconds, earned_seconds)
+       VALUES ($1,$2,$3,$4,$5, timezone('Europe/Istanbul', now()),
+               $6,$7,$7)`,
+      [matchId, qid, userId, norm, isCorrect, maxSec, leftSec]
+    );
+
+    return res.json({ success: true, locked: false });
+  } catch (e) {
+    res.status(500).json({ error: "Cevap kaydedilemedi: " + e.message });
+  }
+});
+
+/* ——— REVEAL / NEXT ——— */
+/**
+ * 24 sn bittiğinde FE bu ucu çağırır:
+ * - Eksik cevap(lar) varsa INFO modunda 'bilmem' ile tamamlanır.
+ * - (SCORE) Skor toplamları status'ta hesaplandığı için burada yalnızca ilerletiriz.
+ * - Son sorudan sonra maçı bitirir (state='finished').
+ * Idempotent: Aynı soruya ikinci kez çağrı ilerletmez.
+ */
+app.post("/api/duello/match/:matchId/reveal", async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const userId  = Number(req.body?.user_id);
+    if (!matchId || !userId) return res.status(400).json({ error: "matchId ve user_id zorunlu" });
+
+    const m = await duelloGetMatch(matchId);
+    if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
+    if (m.state !== "active") {
+      return res.json({ success: true, finished: true, current_index: Number(m.current_index) });
+    }
+    if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
+
+    const total = Number(m.total_questions);
+    const currentPos = Number(m.current_index) + 1;
+    if (currentPos > total) {
+      await run(`UPDATE duello_matches SET state='finished', finished_at=timezone('Europe/Istanbul', now()) WHERE id=$1`, [matchId]);
+      return res.json({ success: true, finished: true, current_index: total });
+    }
+
+    const qid = await duelloGetQuestionIdByPos(matchId, currentPos);
+    if (!qid) {
+      await run(`UPDATE duello_matches SET state='finished', finished_at=timezone('Europe/Istanbul', now()) WHERE id=$1`, [matchId]);
+      return res.json({ success: true, finished: true, current_index: total });
+    }
+
+    // INFO modunda eksikler 'bilmem' ile tamamlanır
+    if (String(m.mode) === "info") {
+      const aId = Number(m.user_a_id), bId = Number(m.user_b_id);
+      const aAns = await get(
+        `SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2 AND user_id=$3`,
+        [matchId, qid, aId]
+      );
+      const bAns = await get(
+        `SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2 AND user_id=$3`,
+        [matchId, qid, bId]
+      );
+
+      const maxSec = 24;
+      if (!aAns) {
+        await run(
+          `INSERT INTO duello_answers
+             (match_id, question_id, user_id, answer, is_correct, created_at,
+              max_time_seconds, time_left_seconds, earned_seconds)
+           VALUES ($1,$2,$3,'bilmem',0, timezone('Europe/Istanbul', now()), $4,0,0)`,
+          [matchId, qid, aId, maxSec]
+        );
+      }
+      if (!bAns) {
+        await run(
+          `INSERT INTO duello_answers
+             (match_id, question_id, user_id, answer, is_correct, created_at,
+              max_time_seconds, time_left_seconds, earned_seconds)
+           VALUES ($1,$2,$3,'bilmem',0, timezone('Europe/Istanbul', now()), $4,0,0)`,
+          [matchId, qid, bId, maxSec]
+        );
+      }
+    }
+
+    // Bu soruya iki cevap var mı? (bilgi: 2 kullanıcı; hız: biri + otomatik bilmem)
+    const cnt = await get(
+      `SELECT COUNT(*)::int AS c FROM duello_answers WHERE match_id=$1 AND question_id=$2`,
+      [matchId, qid]
+    );
+
+    if ((cnt?.c || 0) >= 2) {
+      const nextIdx = Number(m.current_index) + 1;
+      const isLast  = nextIdx >= Number(m.total_questions);
+
+      if (isLast) {
+        await run(
+          `UPDATE duello_matches
+              SET current_index=$2, state='finished', finished_at=timezone('Europe/Istanbul', now())
+            WHERE id=$1`,
+          [matchId, nextIdx]
+        );
+        return res.json({ success: true, finished: true, current_index: nextIdx });
+      }
+
+      await run(`UPDATE duello_matches SET current_index=$2 WHERE id=$1`, [matchId, nextIdx]);
+      return res.json({ success: true, finished: false, current_index: nextIdx });
+    }
+
+    // henüz iki cevap yoksa ilerletme yok
+    return res.json({ success: true, finished: false, current_index: Number(m.current_index) });
+  } catch (e) {
+    res.status(500).json({ error: "Reveal işlemi yapılamadı: " + e.message });
+  }
+});
+
+
+
 /* --------- CEVAP KAYDI ---------- */
 async function insertAnswer({
   user_id, question_id, norm_answer, is_correct,
@@ -1158,6 +1930,232 @@ app.post("/api/user/:userId/ladder-best-level", async (req, res) => {
     res.status(500).json({ error: "En iyi kademe yazılamadı: " + e.message });
   }
 });
+
+
+/* ---------- DUELLO: match summary & basic user stats (read-only) ---------- */
+
+/** Maç genel istatistiklerini (iki oyuncu için) hesapla */
+async function duelloMatchTotals(matchId) {
+  const rows = await all(
+    `
+    SELECT
+      da.user_id,
+      COUNT(*) FILTER (WHERE da.answer = 'bilmem')::int AS bilmem,
+      COUNT(*) FILTER (WHERE da.answer != 'bilmem' AND da.is_correct=1)::int AS correct,
+      COUNT(*) FILTER (WHERE da.answer != 'bilmem' AND da.is_correct=0)::int AS wrong,
+      COALESCE(SUM(
+        CASE
+          WHEN da.answer='bilmem' THEN 0
+          WHEN da.is_correct=1   THEN q.point
+          ELSE -q.point
+        END
+      ),0)::int AS score
+    FROM duello_answers da
+    JOIN questions q ON q.id = da.question_id
+    WHERE da.match_id = $1
+    GROUP BY da.user_id
+    `,
+    [matchId]
+  );
+
+  const map = {};
+  for (const r of rows) map[Number(r.user_id)] = r;
+  return map; // { [user_id]: {bilmem, correct, wrong, score} }
+}
+
+/** Maç özeti: skorlar + kazanan */
+app.get("/api/duello/match/:matchId/summary", async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    const userId  = Number(req.query.user_id);
+    if (!matchId || !userId) return res.status(400).json({ error: "matchId ve user_id zorunlu" });
+
+    const m = await get(`SELECT * FROM duello_matches WHERE id=$1`, [matchId]);
+    if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
+    if (Number(m.user_a_id) !== userId && Number(m.user_b_id) !== userId) {
+      return res.status(403).json({ error: "Bu maça erişiminiz yok" });
+    }
+
+    // Soru setini garanti et (fonksiyon yoksa sessizce geç)
+    if (typeof ensureDuelloQuestionSet === "function") {
+      await ensureDuelloQuestionSet(m);
+    }
+
+    const totals = await duelloMatchTotals(matchId);
+    const aId = Number(m.user_a_id);
+    const bId = Number(m.user_b_id);
+
+    const aStats = totals[aId] || { bilmem:0, correct:0, wrong:0, score:0 };
+    const bStats = totals[bId] || { bilmem:0, correct:0, wrong:0, score:0 };
+
+    let result = { winner_user_id: null, code: "pending" }; // "a_win" | "b_win" | "draw" | "pending"
+    const finished = (m.state === "finished") || (Number(m.current_index) >= Number(m.total_questions));
+
+    if (finished) {
+      if (aStats.score > bStats.score)      result = { winner_user_id: aId, code: "a_win" };
+      else if (bStats.score > aStats.score) result = { winner_user_id: bId, code: "b_win" };
+      else                                  result = { winner_user_id: null, code: "draw" };
+    }
+
+    const you = await get(`SELECT id, ad, soyad, user_code FROM users WHERE id=$1`, [userId]);
+    const opp = await get(
+      `SELECT id, ad, soyad, user_code FROM users WHERE id=$1`,
+      [userId === aId ? bId : aId]
+    );
+
+    return res.json({
+      success: true,
+      finished,
+      mode: String(m.mode),
+      total_questions: Number(m.total_questions),
+      current_index: Number(m.current_index),
+      users: {
+        a: { id: aId, stats: aStats },
+        b: { id: bId, stats: bStats }
+      },
+      you,
+      opponent: opp,
+      result
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Maç özeti alınamadı: " + e.message });
+  }
+});
+
+/**
+ * Kullanıcı bazlı temel düello istatistikleri (read-only)
+ *  - mode bazında: played, wins, losses, draws
+ *  - en çok karşılaşılan rakipler (head-to-head kısa özet)
+ */
+app.get("/api/duello/user/:userId/basic-stats", async (req, res) => {
+  try {
+    const userId = Number(req.params.userId);
+    if (!userId) return res.status(400).json({ error: "userId zorunlu" });
+
+    // 1) Mode bazında W/L/D (sadece bitmiş maçlar)
+    const modeRows = await all(
+      `
+      WITH scores AS (
+        SELECT
+          m.id,
+          m.mode,
+          m.user_a_id,
+          m.user_b_id,
+          SUM(
+            CASE
+              WHEN da.user_id = m.user_a_id THEN
+                CASE WHEN da.answer='bilmem' THEN 0
+                     WHEN da.is_correct=1   THEN q.point
+                     ELSE -q.point
+                END
+              ELSE 0
+            END
+          ) AS score_a,
+          SUM(
+            CASE
+              WHEN da.user_id = m.user_b_id THEN
+                CASE WHEN da.answer='bilmem' THEN 0
+                     WHEN da.is_correct=1   THEN q.point
+                     ELSE -q.point
+                END
+              ELSE 0
+            END
+          ) AS score_b
+        FROM duello_matches m
+        JOIN duello_answers da ON da.match_id = m.id
+        JOIN questions q ON q.id = da.question_id
+        WHERE m.state='finished' AND (m.user_a_id = $1 OR m.user_b_id = $1)
+        GROUP BY m.id, m.mode, m.user_a_id, m.user_b_id
+      )
+      SELECT
+        mode,
+        COUNT(*)::int AS played,
+        COUNT(*) FILTER (
+          WHERE (user_a_id=$1 AND score_a>score_b) OR (user_b_id=$1 AND score_b>score_a)
+        )::int AS wins,
+        COUNT(*) FILTER (
+          WHERE (user_a_id=$1 AND score_a<score_b) OR (user_b_id=$1 AND score_b<score_a)
+        )::int AS losses,
+        COUNT(*) FILTER (WHERE score_a=score_b)::int AS draws
+      FROM scores
+      GROUP BY mode
+      `,
+      [userId]
+    );
+
+    // 2) En çok karşılaşılan rakipler + H2H özeti (top 10)
+    const h2h = await all(
+      `
+      WITH scores AS (
+        SELECT
+          m.id,
+          m.mode,
+          m.user_a_id,
+          m.user_b_id,
+          SUM(
+            CASE WHEN da.user_id = m.user_a_id THEN
+              CASE WHEN da.answer='bilmem' THEN 0
+                   WHEN da.is_correct=1   THEN q.point
+                   ELSE -q.point
+              END ELSE 0 END
+          ) AS score_a,
+          SUM(
+            CASE WHEN da.user_id = m.user_b_id THEN
+              CASE WHEN da.answer='bilmem' THEN 0
+                   WHEN da.is_correct=1   THEN q.point
+                   ELSE -q.point
+              END ELSE 0 END
+          ) AS score_b
+        FROM duello_matches m
+        JOIN duello_answers da ON da.match_id = m.id
+        JOIN questions q ON q.id = da.question_id
+        WHERE m.state='finished' AND (m.user_a_id=$1 OR m.user_b_id=$1)
+        GROUP BY m.id, m.mode, m.user_a_id, m.user_b_id
+      )
+      SELECT
+        CASE WHEN user_a_id=$1 THEN user_b_id ELSE user_a_id END AS opponent_id,
+        COUNT(*)::int AS played,
+        COUNT(*) FILTER (
+          WHERE (user_a_id=$1 AND score_a>score_b) OR (user_b_id=$1 AND score_b>score_a)
+        )::int AS wins,
+        COUNT(*) FILTER (
+          WHERE (user_a_id=$1 AND score_a<score_b) OR (user_b_id=$1 AND score_b<score_a)
+        )::int AS losses,
+        COUNT(*) FILTER (WHERE score_a=score_b)::int AS draws
+      FROM scores
+      GROUP BY opponent_id
+      ORDER BY played DESC
+      LIMIT 10
+      `,
+      [userId]
+    );
+
+    // opponent bilgilerini getir
+    const oppIds = h2h.map(r => Number(r.opponent_id));
+    let oppMap = {};
+    if (oppIds.length) {
+      const rows = await all(
+        `SELECT id, ad, soyad, user_code FROM users WHERE id = ANY($1::int[])`,
+        [oppIds]
+      );
+      for (const r of rows) oppMap[Number(r.id)] = r;
+    }
+
+    return res.json({
+      success: true,
+      user_id: userId,
+      by_mode: modeRows,     // [{ mode:'info'|'speed', played, wins, losses, draws }]
+      top_opponents: h2h.map(x => ({
+        opponent: oppMap[Number(x.opponent_id)] || { id: Number(x.opponent_id) },
+        played: x.played, wins: x.wins, losses: x.losses, draws: x.draws
+      }))
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Kullanıcı düello istatistikleri alınamadı: " + e.message });
+  }
+});
+
+
 
 /* ---------- GÜNLÜK YARIŞMA ---------- */
 async function getOrCreateDailySetIds(dayKey, size) {
