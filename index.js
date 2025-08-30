@@ -747,6 +747,8 @@ async function findUserByIdOrCode({ user_id, user_code }) {
   return null;
 }
 
+
+
 /**
  * Davet oluştur (doğrudan user_code ile).
  * Kural: Tek aktif maç — hem gönderenin hem alıcının aktif maçı olmamalı.
@@ -972,6 +974,28 @@ app.get("/api/duello/outbox/:userId", async (req, res) => {
     res.json({ success: true, invites: rows });
   } catch (e) {
     res.status(500).json({ error: "Giden davetler alınamadı: " + e.message });
+  }
+});
+
+
+/* --- DUELLO: kullanıcının aktif maçı var mı? (inviter için polling) --- */
+app.get("/api/duello/active/:userId", async (req, res) => {
+  try {
+    const uid = Number(req.params.userId);
+    if (!uid) return res.status(400).json({ error: "userId zorunlu" });
+
+    const row = await get(
+      `SELECT id
+         FROM duello_matches
+        WHERE state='active' AND (user_a_id=$1 OR user_b_id=$1)
+        ORDER BY id DESC
+        LIMIT 1`,
+      [uid]
+    );
+
+    res.json({ success: true, match_id: row?.id || null });
+  } catch (e) {
+    res.status(500).json({ error: "Aktif maç kontrolü hatası: " + e.message });
   }
 });
 
