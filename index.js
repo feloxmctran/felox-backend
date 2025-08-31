@@ -3,11 +3,40 @@ const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const { Pool } = require("pg");
+const crypto = require("crypto");
+
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "5mb" }));
+// === SSE (Server-Sent Events) — duello bildirimleri ===
+const sseClients = new Map(); // Map<userId:number, Set<res>>
+
+function sseAdd(userId, res) {
+  const uid = Number(userId);
+  if (!sseClients.has(uid)) sseClients.set(uid, new Set());
+  sseClients.get(uid).add(res);
+}
+
+function sseRemove(userId, res) {
+  const uid = Number(userId);
+  const set = sseClients.get(uid);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) sseClients.delete(uid);
+}
+
+function sseEmit(userId, event, payload = {}) {
+  const uid = Number(userId);
+  const set = sseClients.get(uid);
+  if (!set || set.size === 0) return;
+  const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const r of set) {
+    try { r.write(msg); } catch (_) { /* ignore broken pipe */ }
+  }
+}
+
 
 /* ---------- PG CONNECTION ---------- */
 if (!process.env.DATABASE_URL) {
@@ -41,6 +70,40 @@ async function run(sql, params = []) { await pool.query(sql, params); return { s
 async function get(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
 
+function randomReadableCode(len = 6) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // O, I, 0, 1 yok
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    out += alphabet[crypto.randomInt(0, alphabet.length)];
+  }
+  return out;
+}
+
+async function ensureUserCodeForUser(userId) {
+  const row = await get(`SELECT user_code FROM users WHERE id=$1`, [userId]);
+  if (!row) return null;
+  if (row.user_code) return row.user_code;
+
+  // Çakışmaları önlemek için 10 kez dene
+  for (let i = 0; i < 10; i++) {
+    const code = randomReadableCode(6);
+    const upd = await get(
+      `UPDATE users
+          SET user_code = $2
+        WHERE id = $1
+          AND user_code IS NULL
+          AND NOT EXISTS (SELECT 1 FROM users WHERE user_code = $2)
+      RETURNING user_code`,
+      [userId, code]
+    );
+    if (upd?.user_code) return upd.user_code;
+  }
+  // eşzamanlı üretim olduysa son halini dön
+  const last = await get(`SELECT user_code FROM users WHERE id=$1`, [userId]);
+  return last?.user_code || null;
+}
+
+
 /* ---------- ENV (Günlük Yarışma) ---------- */
 const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
@@ -56,6 +119,44 @@ const DUELLO_IDLE_ABORT_SEC = Math.max(
 /* ---------- HEALTH ---------- */
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.send("healthy"));
+
+
+// === DUELLO SSE stream ===
+// Tarayıcı: new EventSource(`${API}/api/duello/events/${userId}`)
+app.get("/api/duello/events/:userId", (req, res) => {
+  const uid = Number(req.params.userId);
+  if (!uid) return res.status(400).end();
+
+  // SSE başlıkları
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // proxy buffer kapatma
+  // CORS (bazı proxy katmanlarında gerekli olabiliyor)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // İlk flush (varsa)
+  try { res.flushHeaders?.(); } catch {}
+
+  // Kayda al
+  sseAdd(uid, res);
+
+  // Hoş geldin olayı
+  res.write(`event: ready\ndata: {}\n\n`);
+
+  // Bağlantıyı canlı tutmak için ping (Render/Vercel timeoutlarını önler)
+  const ping = setInterval(() => {
+    try { res.write(`: ping ${Date.now()}\n\n`); } catch {}
+  }, 25000);
+
+  // Bağlantı kapanınca temizle
+  req.on("close", () => {
+    clearInterval(ping);
+    sseRemove(uid, res);
+    try { res.end(); } catch {}
+  });
+});
+
 
 /* ---------- HELPERS ---------- */
 function periodSql(period, alias = "a") {
@@ -163,6 +264,22 @@ async function init() {
     password TEXT,
     role TEXT
   )`);
+
+await run(`
+  ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS user_code TEXT
+`);
+await run(`
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_users_user_code
+  ON users(user_code) WHERE user_code IS NOT NULL
+`);
+
+
+await run(`
+  ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS user_code TEXT UNIQUE
+`);
+
 
   await run(`CREATE TABLE IF NOT EXISTS surveys (
     id SERIAL PRIMARY KEY,
@@ -416,19 +533,6 @@ await run(`
     ADD COLUMN IF NOT EXISTS ended_reason TEXT
 `);
 
-// --- DUELLO: Eski tablolar için güvenli migrasyonlar (kolon eklemeleri) ---
-await run(`
-  ALTER TABLE duello_matches
-    ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS state TEXT,
-    ADD COLUMN IF NOT EXISTS total_questions INTEGER,
-    ADD COLUMN IF NOT EXISTS current_index INTEGER,
-    ADD COLUMN IF NOT EXISTS last_seen_a TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS last_seen_b TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS ended_reason TEXT
-`);
 
 await run(`UPDATE duello_matches SET state = COALESCE(state,'active')`);
 await run(`ALTER TABLE duello_matches ALTER COLUMN state SET DEFAULT 'active'`);
@@ -575,6 +679,11 @@ app.post("/api/register", async (req, res) => {
   [email]
 );
 
+if (user && !user.user_code) {
+  user.user_code = await ensureUserCodeForUser(user.id);
+}
+
+
     res.json({ success: true, user });
   } catch (err) {
     if (String(err.message).includes("duplicate key")) return res.status(400).json({ error: "Bu e-posta zaten kayıtlı." });
@@ -595,6 +704,11 @@ app.post("/api/login", async (req, res) => {
    FROM users WHERE email=$1 AND password=$2`,
   [email, password]
 );
+
+if (user && !user.user_code) {
+  user.user_code = await ensureUserCodeForUser(user.id);
+}
+
 
     if (!user) return res.status(401).json({ error: "E-posta veya şifre yanlış." });
     res.json({ success: true, user });
@@ -744,16 +858,17 @@ app.get("/api/quotes/random", async (_req, res) => {
 // -- RO: user_code oku
 app.get("/api/user/:userId/user-code", async (req, res) => {
   try {
-    const row = await get(
-      `SELECT user_code FROM users WHERE id=$1`,
-      [req.params.userId]
-    );
-    if (!row) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
-    res.json({ success: true, user_code: row.user_code });
+    const uid = Number(req.params.userId);
+    const u = await get(`SELECT id FROM users WHERE id=$1`, [uid]);
+    if (!u) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+
+    const code = await ensureUserCodeForUser(uid);
+    res.json({ success: true, user_code: code });
   } catch (e) {
     res.status(500).json({ error: "user_code alınamadı" });
   }
 });
+
 
 // Onaylı kategoriler handler'ı: 3 route aynı fonksiyonu kullanır
 async function handleApprovedSurveys(req, res) {
@@ -1039,6 +1154,19 @@ await run(`
       [fromId, toId, mode]
     );
 
+// --- SSE: alıcıyı bilgilendir
+try {
+  const fromUser = await get(
+    `SELECT id, ad, soyad, user_code FROM users WHERE id=$1`,
+    [fromId]
+  );
+  sseEmit(toId, "invite:new", {
+    invite: inv,
+    from: fromUser || { id: fromId },
+  });
+} catch (_) { /* sessiz geç */ }
+
+
     return res.json({ success: true, invite: inv });
   } catch (e) {
     res.status(500).json({ error: "Davet oluşturulamadı: " + e.message });
@@ -1091,6 +1219,12 @@ app.post("/api/duello/invite/respond", async (req, res) => {
         RETURNING id, status, rejected_at`,
         [inviteId]
       );
+
+      // --- SSE: gönderene davetin reddedildiğini bildir
+try {
+  sseEmit(inv.from_user_id, "invite:rejected", { invite_id: inviteId });
+} catch (_) {}
+
       return res.json({ success: true, invite: row });
     }
 
@@ -1141,6 +1275,13 @@ RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
       [inviteId, fromId, toId]
     );
 
+// --- SSE: kabul edildi -> her iki tarafa (özellikle gönderene) bildir
+try {
+  sseEmit(fromId, "invite:accepted", { invite_id: inviteId, match_id: match.id });
+  sseEmit(toId,   "invite:accepted", { invite_id: inviteId, match_id: match.id });
+} catch (_) {}
+
+
     return res.json({ success: true, invite: acc, match });
   } catch (e) {
     res.status(500).json({ error: "Davet yanıtlanamadı: " + e.message });
@@ -1168,6 +1309,12 @@ app.post("/api/duello/invite/cancel", async (req, res) => {
       RETURNING id, status, cancelled_at`,
       [inviteId]
     );
+// --- SSE: alıcıya iptal bilgisini ilet
+try {
+  sseEmit(inv.to_user_id, "invite:cancelled", { invite_id: inviteId });
+} catch (_) {}
+
+
     return res.json({ success: true, invite: row });
   } catch (e) {
     res.status(500).json({ error: "Davet iptal edilemedi: " + e.message });
@@ -1516,36 +1663,45 @@ await run(
     const leftSec = Math.max(0, Math.min(leftRaw, maxSec));
 
     if (String(m.mode) === "speed") {
-      if (prev.length > 0) {
-        // Çoktan kilitlendi; kullanıcıdan geleni reddet
-        return res.status(409).json({ error: "Soru kilitlendi (hız modu)" });
-      }
-      // 1) Benim cevabım
-      await run(
-        `INSERT INTO duello_answers
-           (match_id, question_id, user_id, answer, is_correct, created_at,
-            max_time_seconds, time_left_seconds, earned_seconds)
-         VALUES ($1,$2,$3,$4,$5, timezone('Europe/Istanbul', now()),
-                 $6,$7,$7)`,
-        [matchId, qid, userId, norm, isCorrect, maxSec, leftSec]
-      );
-      // 2) Rakibe anında 'bilmem'
-      const oppId = opponentId(m, userId);
-      const oppPrev = await get(
-        `SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2 AND user_id=$3`,
-        [matchId, qid, oppId]
-      );
-      if (!oppPrev) {
-        await run(
-          `INSERT INTO duello_answers
-             (match_id, question_id, user_id, answer, is_correct, created_at,
-              max_time_seconds, time_left_seconds, earned_seconds)
-           VALUES ($1,$2,$3,'bilmem',0, timezone('Europe/Istanbul', now()), $4,0,0)`,
-          [matchId, qid, oppId, maxSec]
-        );
-      }
-      return res.json({ success: true, locked: true });
-    }
+  // 1) İlk cevabı atomik şekilde yaz (NOT EXISTS ile)
+  const ins = await get(`
+    WITH ins AS (
+      INSERT INTO duello_answers
+        (match_id, question_id, user_id, answer, is_correct, created_at,
+         max_time_seconds, time_left_seconds, earned_seconds)
+      SELECT $1,$2,$3,$4,$5, timezone('Europe/Istanbul', now()),
+             $6,$7,$7
+      WHERE NOT EXISTS (
+        SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2
+      )
+      RETURNING 1 AS ok
+    )
+    SELECT COALESCE((SELECT ok FROM ins), 0) AS ok
+  `, [matchId, qid, userId, norm, isCorrect, maxSec, leftSec]);
+
+  if (!ins?.ok) {
+    return res.status(409).json({ error: "Soru kilitlendi (hız modu)" });
+  }
+
+  // 2) Rakibe anında 'bilmem' (yoksa)
+  const oppId = opponentId(m, userId);
+  const oppPrev = await get(
+    `SELECT 1 FROM duello_answers WHERE match_id=$1 AND question_id=$2 AND user_id=$3`,
+    [matchId, qid, oppId]
+  );
+  if (!oppPrev) {
+    await run(
+      `INSERT INTO duello_answers
+         (match_id, question_id, user_id, answer, is_correct, created_at,
+          max_time_seconds, time_left_seconds, earned_seconds)
+       VALUES ($1,$2,$3,'bilmem',0, timezone('Europe/Istanbul', now()), $4,0,0)`,
+      [matchId, qid, oppId, maxSec]
+    );
+  }
+
+  return res.json({ success: true, locked: true });
+}
+
 
     // bilgi modu: serbest, sadece kaydet
     await run(
