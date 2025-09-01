@@ -31,11 +31,21 @@ function sseEmit(userId, event, payload = {}) {
   const uid = Number(userId);
   const set = sseClients.get(uid);
   if (!set || set.size === 0) return;
-  const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+
+  // Named event
+  const named = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+
+  // Fallback: default "message" event (type alanı ile)
+  const fallback = `data: ${JSON.stringify({ type: event, ...payload })}\n\n`;
+
   for (const r of set) {
-    try { r.write(msg); } catch (_) { /* ignore broken pipe */ }
+    try {
+      r.write(named);
+      r.write(fallback); // sadece onmessage dinleyen FE için
+    } catch (_) {}
   }
 }
+
 
 
 /* ---------- PG CONNECTION ---------- */
@@ -1337,7 +1347,9 @@ app.get("/api/duello/inbox/:userId", async (req, res) => {
         ORDER BY i.created_at DESC`,
       [uid]
     );
-    res.json({ success: true, invites: rows });
+    // FE uyumluluğu: hem "invites" hem "inbox" döndür
+res.json({ success: true, invites: rows, inbox: rows });
+
   } catch (e) {
     res.status(500).json({ error: "Gelen davetler alınamadı: " + e.message });
   }
@@ -1359,7 +1371,9 @@ app.get("/api/duello/outbox/:userId", async (req, res) => {
         ORDER BY i.created_at DESC`,
       [uid]
     );
-    res.json({ success: true, invites: rows });
+    // FE uyumluluğu: hem "invites" hem "outbox" döndür
+res.json({ success: true, invites: rows, outbox: rows });
+
   } catch (e) {
     res.status(500).json({ error: "Giden davetler alınamadı: " + e.message });
   }
