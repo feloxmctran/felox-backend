@@ -285,12 +285,6 @@ await run(`
 `);
 
 
-await run(`
-  ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS user_code TEXT UNIQUE
-`);
-
-
   await run(`CREATE TABLE IF NOT EXISTS surveys (
     id SERIAL PRIMARY KEY,
     editor_id INTEGER REFERENCES users(id),
@@ -2103,7 +2097,7 @@ app.get("/api/user/:userId/performance", async (req, res) => {
 });
 
 // --- KADEMELİ: seviye atlama şartları ---
-const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS ?? 100); // varsayılanı 100 (ürün kuralı)
+const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS ?? 10); // varsayılanı 100 (ürün kuralı)
 const LADDER_REQUIRED_RATE = Number(process.env.LADDER_REQUIRED_RATE || 0.8); // %80 başarı
 const LADDER_DEFAULT_LIMIT = Math.max(1, parseInt(process.env.LADDER_QUESTIONS_LIMIT || "20", 10));
 
@@ -2169,12 +2163,22 @@ app.post("/api/ladder/session/start", async (req, res) => {
     // mevcut şemaya uygun: tek satırlık oturum, seviye değişince sayaçlar sıfırlanır
     await ensureLadderSession(userId, lvl, true);
 
+
+        // En iyi seviyeyi güvenceye al (geri düşürmez)
+    try {
+      await bumpLadderBest(userId, lvl);
+    } catch (e) {
+      console.error("bumpLadderBest fail (/ladder/session/start):", e.message);
+    }
+
+
     return res.json({ success: true });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Kademeli oturum başlatılamadı: " + e.message });
   }
 });
+
 
 app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
@@ -2361,6 +2365,14 @@ app.post("/api/ladder/start", async (req, res) => {
     // reset=true -> attempts=0, correct=0, current_level=level, start_ts=now()
     await ensureLadderSession(user_id, level, true);
 
+        // En iyi seviyeyi güvenceye al (geri düşürmez)
+    try {
+      await bumpLadderBest(user_id, level);
+    } catch (e) {
+      console.error("bumpLadderBest fail (/ladder/start):", e.message);
+    }
+
+
     // dönen başlangıç bilgisi (hepsi 0)
     return res.json({
       success: true,
@@ -2388,6 +2400,9 @@ app.get("/api/user/:userId/ladder-best-level", async (req, res) => {
     res.status(500).json({ error: "En iyi kademe alınamadı" });
   }
 });
+
+
+
 
 // --- KADEMELİ: en iyi (erişilen) seviye: yaz (frontend'in beklediği) ---
 app.post("/api/user/:userId/ladder-best-level", async (req, res) => {
