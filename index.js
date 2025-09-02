@@ -125,6 +125,11 @@ const DUELLO_IDLE_ABORT_SEC = Math.max(
   Math.min(600, parseInt(process.env.DUELLO_IDLE_ABORT_SEC || "90", 10))
 );
 
+/* ---------- ENV (Düello zamanlama) ---------- */
+const DUELLO_PER_Q_SEC  = Math.max(5, parseInt(process.env.DUELLO_PER_Q_SEC || "16", 10));
+const DUELLO_REVEAL_SEC = Math.max(1, parseInt(process.env.DUELLO_REVEAL_SEC || "3", 10));
+
+
 
 /* ---------- HEALTH ---------- */
 app.get("/", (_req, res) => res.send("OK"));
@@ -649,24 +654,38 @@ init()
 // --- DUELLO: idle-timeout yardımcı fonksiyon (şimdilik sadece tanımlı) ---
 async function duelloIdleAbortTick() {
   try {
-    const sec = DUELLO_IDLE_ABORT_SEC; // sonraki adımda env/varsayılan ekleyeceğiz
-    await run(`
-      UPDATE duello_matches
-         SET state='abandoned',
-             ended_reason='idle_timeout',
-             finished_at = timezone('Europe/Istanbul', now()),
-             abandoned_at = timezone('Europe/Istanbul', now())
-       WHERE state='active'
-         AND (
-              COALESCE(last_seen_a, TIMESTAMP 'epoch') < timezone('Europe/Istanbul', now()) - interval '${sec} seconds'
-           OR COALESCE(last_seen_b, TIMESTAMP 'epoch') < timezone('Europe/Istanbul', now()) - interval '${sec} seconds'
-         )
-         AND current_index < total_questions
+    const sec = DUELLO_IDLE_ABORT_SEC;
+    const updated = await all(`
+      WITH upd AS (
+        UPDATE duello_matches
+           SET state='abandoned',
+               ended_reason='idle_timeout',
+               finished_at = timezone('Europe/Istanbul', now()),
+               abandoned_at = timezone('Europe/Istanbul', now())
+         WHERE state='active'
+           AND (
+                COALESCE(last_seen_a, TIMESTAMP 'epoch') < timezone('Europe/Istanbul', now()) - interval '${sec} seconds'
+             OR COALESCE(last_seen_b, TIMESTAMP 'epoch') < timezone('Europe/Istanbul', now()) - interval '${sec} seconds'
+           )
+           AND current_index < total_questions
+         RETURNING id, user_a_id, user_b_id
+      )
+      SELECT id, user_a_id, user_b_id FROM upd
     `);
+
+    if (updated?.length) {
+      for (const m of updated) {
+        try {
+          sseEmit(Number(m.user_a_id), "match:abandoned", { match_id: Number(m.id) });
+          sseEmit(Number(m.user_b_id), "match:abandoned", { match_id: Number(m.id) });
+        } catch (_) {}
+      }
+    }
   } catch (e) {
     console.error("duelloIdleAbortTick hata:", e.message);
   }
 }
+
 
 
 /* ---------- AUTH ---------- */
@@ -1135,67 +1154,14 @@ app.get("/api/duello/random-ready", async (req, res) => {
 });
 
 // POST: eşleşmeyi hemen başlatır ve match_id döner
-app.post("/api/duello/random-ready/start", async (req, res) => {
-  try {
-    const userId = Number(req.body?.user_id);
-    const mode   = String(req.body?.mode || "info").toLowerCase();
-    if (!userId) return res.status(400).json({ error: "user_id zorunlu" });
-    if (!["info", "speed"].includes(mode)) return res.status(400).json({ error: "Geçersiz mode" });
-
-    // Ben aktif miyim?
-    if (await hasActiveMatch(userId)) {
-      const existing = await get(
-        `SELECT id FROM duello_matches WHERE state='active' AND (user_a_id=$1 OR user_b_id=$1) ORDER BY id DESC LIMIT 1`,
-        [userId]
-      );
-      return res.json({ success: true, match: existing ? { id: existing.id } : null });
-    }
-
-    // Hazır rakip bul
-    const opp = await findRandomReadyOpponent(userId);
-    if (!opp) return res.json({ success: true, error: "Şu an hazır rakip bulunamadı." });
-
-    if (await hasActiveMatch(opp.id)) {
-      return res.json({ success: true, error: "Rakip şu an meşgul." });
-    }
-
-    // Maçı oluştur
-    const match = await get(
-      `INSERT INTO duello_matches
-         (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
-          last_seen_a, last_seen_b, last_activity_at)
-       VALUES ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0,
-               timezone('Europe/Istanbul', now()),
-               timezone('Europe/Istanbul', now()),
-               timezone('Europe/Istanbul', now()))
-       RETURNING id`,
-      [mode, userId, opp.id]
-    );
-
-    // Tarafların diğer pending davetlerini güvenlik için iptal et
-    await run(
-      `UPDATE duello_invites
-          SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
-        WHERE status='pending'
-          AND expire_at > timezone('Europe/Istanbul', now())
-          AND (from_user_id IN ($1,$2) OR to_user_id IN ($1,$2))`,
-      [userId, opp.id]
-    );
-
-    // (İstersen SSE ile bildirim atabilirsin)
-    try {
-      sseEmit(userId, "match:created", { match_id: match.id, opponent: opp });
-      sseEmit(opp.id,   "match:created", { match_id: match.id, opponent_user_id: userId });
-    } catch (_) {}
-
-    res.json({ success: true, match: { id: match.id }, opponent: opp });
-  } catch (e) {
-    res.status(500).json({ error: "random-ready/start başarısız: " + e.message });
-  }
+app.post("/api/duello/random-ready/start", (req, res) => {
+  return res.status(410).json({
+    error: "Bu uç kapatıldı. Yeni akış: GET /api/duello/random-ready + POST /api/duello/invite"
+  });
 });
 
 
-/**
+    /**
  * Davet oluştur (doğrudan user_code ile).
  * Kural: Tek aktif maç — hem gönderenin hem alıcının aktif maçı olmamalı.
  * Not: Alıcı 'ready=OFF' olsa bile user_code ile doğrudan davet GİDER (kuralınız).
@@ -1323,96 +1289,129 @@ try {
       return res.json({ success: true, invite: row });
     }
 
-    // ACCEPT
+        // ACCEPT
     const fromId = Number(inv.from_user_id);
     const toId   = Number(inv.to_user_id);
 
-    // tek aktif maç kontrolü (son kez)
-    if (await hasActiveMatch(fromId)) return res.status(409).json({ error: "Gönderenin aktif düellosu var" });
-    if (await hasActiveMatch(toId))   return res.status(409).json({ error: "Alıcının aktif düellosu var" });
-
-    // maçı yarat (24 soru hedefi, soru setini bir sonraki adımda ekleyeceğiz)
-    const match = await get(
-      `INSERT INTO duello_matches
-  (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
-   last_seen_a, last_seen_b, last_activity_at)
-VALUES
-  ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0,
-   timezone('Europe/Istanbul', now()),
-   timezone('Europe/Istanbul', now()),
-   timezone('Europe/Istanbul', now()))
-RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
-      [inv.mode, fromId, toId]
-    );
-
-    // daveti accepted yap + mümkünse match_id bağla (kolon yoksa dene/boşver)
-    const acc = await get(
-      `UPDATE duello_invites
-          SET status='accepted',
-              accepted_at=timezone('Europe/Istanbul', now())
-        WHERE id=$1
-      RETURNING id, status, accepted_at`,
-      [inviteId]
-    );
-    // match_id kolonu varsa yaz, yoksa yut
+    // === Atomik kabul: transaction + advisory lock ===
+    const client = await pool.connect();
     try {
-      await run(`UPDATE duello_invites SET match_id=$2 WHERE id=$1`, [inviteId, match.id]);
-    } catch (_) {}
+      await client.query('BEGIN');
 
-    // Tarafların diğer pending davetlerini iptal et (isteğe bağlı güvenlik)
-    await run(
-      `UPDATE duello_invites
-          SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
-        WHERE status='pending'
-          AND expire_at > timezone('Europe/Istanbul', now())
-          AND id <> $1
-          AND (from_user_id IN ($2,$3) OR to_user_id IN ($2,$3))`,
-      [inviteId, fromId, toId]
-    );
+      // Deadlock olmasın diye küçük-id önce
+      const lo = Math.min(fromId, toId), hi = Math.max(fromId, toId);
+      await client.query('SELECT pg_advisory_xact_lock($1)', [lo]);
+      await client.query('SELECT pg_advisory_xact_lock($1)', [hi]);
 
-// --- SSE: kabul edildi -> her iki tarafa (özellikle gönderene) bildir
-try {
-  sseEmit(fromId, "invite:accepted", { invite_id: inviteId, match_id: match.id });
-  sseEmit(toId,   "invite:accepted", { invite_id: inviteId, match_id: match.id });
-} catch (_) {}
+      // Daveti tekrar kilitle-ve-kontrol
+      const invRow = await client.query(
+        `SELECT id, status, expire_at, mode, from_user_id, to_user_id
+           FROM duello_invites
+          WHERE id=$1
+          FOR UPDATE`,
+        [inviteId]
+      );
+      if (!invRow.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: "Davet bulunamadı" });
+      }
+      const lockedInv = invRow.rows[0];
+      if (lockedInv.status !== 'pending') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: "Davet artık pending değil" });
+      }
 
+      // Süresi dolmuş mu?
+      const exp = await client.query(
+        `SELECT (expire_at <= timezone('Europe/Istanbul', now())) AS expired
+           FROM duello_invites WHERE id=$1`,
+        [inviteId]
+      );
+      if (exp.rows[0]?.expired) {
+        await client.query(
+          `UPDATE duello_invites
+              SET status='expired'
+            WHERE id=$1`,
+          [inviteId]
+        );
+        await client.query('COMMIT');
+        return res.status(410).json({ error: "Davetin süresi dolmuş" });
+      }
 
-    return res.json({ success: true, invite: acc, match });
+      // Tek aktif maç kuralını tx içinde kontrol et
+      const actA = await client.query(
+        `SELECT 1 FROM duello_matches
+          WHERE state='active' AND (user_a_id=$1 OR user_b_id=$1) LIMIT 1`,
+        [fromId]
+      );
+      if (actA.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: "Gönderenin aktif düellosu var" });
+      }
+      const actB = await client.query(
+        `SELECT 1 FROM duello_matches
+          WHERE state='active' AND (user_a_id=$1 OR user_b_id=$1) LIMIT 1`,
+        [toId]
+      );
+      if (actB.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: "Alıcının aktif düellosu var" });
+      }
+
+      // Maçı oluştur
+      const matchIns = await client.query(
+        `INSERT INTO duello_matches
+          (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
+           last_seen_a, last_seen_b, last_activity_at)
+         VALUES
+          ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0,
+           timezone('Europe/Istanbul', now()),
+           timezone('Europe/Istanbul', now()),
+           timezone('Europe/Istanbul', now()))
+         RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
+        [lockedInv.mode, fromId, toId]
+      );
+      const match = matchIns.rows[0];
+
+      // Daveti accepted yap + match_id ekle
+      await client.query(
+        `UPDATE duello_invites
+            SET status='accepted',
+                accepted_at=timezone('Europe/Istanbul', now()),
+                match_id=$2
+          WHERE id=$1`,
+        [inviteId, match.id]
+      );
+
+      // Tarafların diğer pending davetlerini iptal et
+      await client.query(
+        `UPDATE duello_invites
+            SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
+          WHERE status='pending'
+            AND expire_at > timezone('Europe/Istanbul', now())
+            AND id <> $1
+            AND (from_user_id IN ($2,$3) OR to_user_id IN ($2,$3))`,
+        [inviteId, fromId, toId]
+      );
+
+      await client.query('COMMIT');
+
+      // SSE (tx dışı)
+      try {
+        sseEmit(fromId, "invite:accepted", { invite_id: inviteId, match_id: match.id });
+        sseEmit(toId,   "invite:accepted", { invite_id: inviteId, match_id: match.id });
+      } catch (_) {}
+
+      return res.json({ success: true, invite: { id: inviteId, status: 'accepted' }, match });
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+
   } catch (e) {
     res.status(500).json({ error: "Davet yanıtlanamadı: " + e.message });
-  }
-});
-
-/** Gönderen tarafından daveti iptal et (pending iken) */
-app.post("/api/duello/invite/cancel", async (req, res) => {
-  try {
-    const inviteId = Number(req.body?.invite_id);
-    const userId   = Number(req.body?.user_id);
-    if (!inviteId || !userId) return res.status(400).json({ error: "invite_id ve user_id zorunlu" });
-
-    await expireOldInvites();
-
-    const inv = await get(`SELECT * FROM duello_invites WHERE id=$1`, [inviteId]);
-    if (!inv) return res.status(404).json({ error: "Davet bulunamadı" });
-    if (Number(inv.from_user_id) !== userId) return res.status(403).json({ error: "Yalnızca gönderen iptal edebilir" });
-    if (inv.status !== "pending") return res.status(409).json({ error: "Bu davet pending değil" });
-
-    const row = await get(
-      `UPDATE duello_invites
-          SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
-        WHERE id=$1
-      RETURNING id, status, cancelled_at`,
-      [inviteId]
-    );
-// --- SSE: alıcıya iptal bilgisini ilet
-try {
-  sseEmit(inv.to_user_id, "invite:cancelled", { invite_id: inviteId });
-} catch (_) {}
-
-
-    return res.json({ success: true, invite: row });
-  } catch (e) {
-    res.status(500).json({ error: "Davet iptal edilemedi: " + e.message });
   }
 });
 
@@ -1466,108 +1465,12 @@ res.json({ success: true, invites: rows, outbox: rows });
 
 // === DUELLO: Rastgele hazır rakip bul ve maçı başlat ===
 // FE: POST /api/duello/random-ready  body: { user_id, mode: 'info'|'speed' }
-app.post("/api/duello/random-ready", async (req, res) => {
-  try {
-    const userId = Number(req.body?.user_id);
-    const mode = String(req.body?.mode || "info").toLowerCase(); // 'info' | 'speed'
-    if (!userId) return res.status(400).json({ error: "user_id zorunlu" });
-    if (!["info", "speed"].includes(mode))
-      return res.status(400).json({ error: "mode 'info' veya 'speed' olmalı" });
-
-    // Kullanıcı var mı?
-    const me = await get(`SELECT id, ad, soyad, user_code FROM users WHERE id=$1`, [userId]);
-    if (!me) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
-
-    // Profilini garantiye al + hazır & public mi?
-    const prof = await ensureDuelloProfile(userId);
-    if (!prof?.ready) return res.status(409).json({ error: "Profilin 'Hazırım' değil." });
-    if (prof?.visibility_mode !== "public")
-      return res.status(409).json({ error: "Görünürlüğün 'Herkese Açık' değil." });
-
-    // aktif maç var mı?
-    await expireOldInvites();
-    // Biten ama state=active kalmış maçları temizle (güvence: davet ucunda da yaptık)
-    await run(`
-      UPDATE duello_matches
-         SET state='finished', finished_at = timezone('Europe/Istanbul', now())
-       WHERE state='active' AND current_index >= total_questions
-    `);
-
-    if (await hasActiveMatch(userId))
-      return res.status(409).json({ error: "Zaten aktif bir düellon var." });
-
-    // Rakip ara: ready=true + public + aktif maçı yok + pending daveti yok + kendisi değil
-    const opp = await get(
-      `
-      SELECT u.id, u.ad, u.soyad, u.user_code
-        FROM duello_profiles p
-        JOIN users u ON u.id = p.user_id
-       WHERE p.ready = true
-         AND p.visibility_mode = 'public'
-         AND u.id <> $1
-         AND NOT EXISTS (
-               SELECT 1 FROM duello_matches m
-                WHERE m.state='active' AND (m.user_a_id = u.id OR m.user_b_id = u.id)
-             )
-         AND NOT EXISTS (
-               SELECT 1 FROM duello_invites i
-                WHERE i.status='pending'
-                  AND i.expire_at > timezone('Europe/Istanbul', now())
-                  AND (i.from_user_id = u.id OR i.to_user_id = u.id)
-             )
-       ORDER BY COALESCE(p.last_ready_at, timezone('Europe/Istanbul', now())) DESC,
-                u.id ASC
-       LIMIT 1
-      `,
-      [userId]
-    );
-
-    if (!opp) {
-      return res.status(404).json({ error: "Şu an hazır rakip bulunamadı." });
-    }
-
-    // İki taraf için de son kontrol: aktif maç engeli (yarış koşulu)
-    if (await hasActiveMatch(opp.id))
-      return res.status(409).json({ error: "Rakibin aktif düellosu oluştu." });
-
-    // Maçı doğrudan oluştur (davet basamağı olmadan)
-    const match = await get(
-      `
-      INSERT INTO duello_matches
-        (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
-         last_seen_a, last_seen_b, last_activity_at)
-      VALUES
-        ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0,
-         timezone('Europe/Istanbul', now()),
-         timezone('Europe/Istanbul', now()),
-         timezone('Europe/Istanbul', now()))
-      RETURNING id, mode, user_a_id, user_b_id, state, total_questions
-      `,
-      [mode, userId, opp.id]
-    );
-
-    // Her iki taraftaki diğer pending davetleri iptal et (gürültüyü azalt)
-    await run(
-      `UPDATE duello_invites
-          SET status='cancelled', cancelled_at=timezone('Europe/Istanbul', now())
-        WHERE status='pending'
-          AND expire_at > timezone('Europe/Istanbul', now())
-          AND (from_user_id IN ($1,$2) OR to_user_id IN ($1,$2))`,
-      [userId, opp.id]
-    );
-
-    // SSE ile haber ver (varsa açık)
-    try {
-      sseEmit(userId, "match:started", { match_id: match.id, opponent: opp, mode });
-      sseEmit(opp.id, "match:started", { match_id: match.id, opponent: me,  mode });
-    } catch (_) {}
-
-    return res.json({ success: true, match, opponent: opp });
-  } catch (e) {
-    console.error("random-ready fail:", e);
-    return res.status(500).json({ error: "Rastgele eşleşme yapılamadı: " + e.message });
-  }
+app.post("/api/duello/random-ready", (req, res) => {
+  return res.status(410).json({
+    error: "Bu uç kapatıldı. Yeni akış: GET /api/duello/random-ready + POST /api/duello/invite"
+  });
 });
+
 
 
 /* --- DUELLO: kullanıcının aktif maçı var mı? (inviter için polling) --- */
@@ -1795,7 +1698,7 @@ await run(
       question: { pos: currentPos, ...q },
       answers: { mine: myAns, opponent: oppAns },
       scores,
-      ui: { per_question_seconds: 16, reveal_seconds: 3 }
+      ui: { per_question_seconds: DUELLO_PER_Q_SEC, reveal_seconds: DUELLO_REVEAL_SEC }
     });
   } catch (e) {
     res.status(500).json({ error: "Maç durumu alınamadı: " + e.message });
@@ -1862,7 +1765,7 @@ await run(
     const isCorrect = qc?.correct_answer === norm ? 1 : 0;
 
     // Zaman alanları
-    const maxSec = Number.isFinite(mls) ? Math.max(1, Math.min(120, Math.round(mls))) : 16;
+    const maxSec = Number.isFinite(mls) ? Math.max(1, Math.min(120, Math.round(mls))) : DUELLO_PER_Q_SEC;
     const leftRaw = Number.isFinite(tls) ? Math.round(tls) : 0;
     const leftSec = Math.max(0, Math.min(leftRaw, maxSec));
 
@@ -1940,6 +1843,11 @@ app.post("/api/duello/match/:matchId/reveal", async (req, res) => {
     const m = await duelloGetMatch(matchId);
     if (!m) return res.status(404).json({ error: "Maç bulunamadı" });
     if (m.state !== "active") {
+      try {
+  sseEmit(Number(m.user_a_id), "match:finished", { match_id: Number(m.id) });
+  sseEmit(Number(m.user_b_id), "match:finished", { match_id: Number(m.id) });
+} catch (_) {}
+
       return res.json({ success: true, finished: true, current_index: Number(m.current_index) });
     }
     if (!inThisMatch(m, userId)) return res.status(403).json({ error: "Bu maça erişiminiz yok" });
@@ -1957,15 +1865,25 @@ await run(
     const total = Number(m.total_questions);
     const currentPos = Number(m.current_index) + 1;
     if (currentPos > total) {
-      await run(`UPDATE duello_matches SET state='finished', finished_at=timezone('Europe/Istanbul', now()) WHERE id=$1`, [matchId]);
-      return res.json({ success: true, finished: true, current_index: total });
-    }
+  await run(`UPDATE duello_matches SET state='finished', finished_at=timezone('Europe/Istanbul', now()) WHERE id=$1`, [matchId]);
+  try {
+    sseEmit(Number(m.user_a_id), "match:finished", { match_id: Number(m.id) });
+    sseEmit(Number(m.user_b_id), "match:finished", { match_id: Number(m.id) });
+  } catch (_) {}
+  return res.json({ success: true, finished: true, current_index: total });
+}
+
 
     const qid = await duelloGetQuestionIdByPos(matchId, currentPos);
     if (!qid) {
-      await run(`UPDATE duello_matches SET state='finished', finished_at=timezone('Europe/Istanbul', now()) WHERE id=$1`, [matchId]);
-      return res.json({ success: true, finished: true, current_index: total });
-    }
+  await run(`UPDATE duello_matches SET state='finished', finished_at=timezone('Europe/Istanbul', now()) WHERE id=$1`, [matchId]);
+  try {
+    sseEmit(Number(m.user_a_id), "match:finished", { match_id: Number(m.id) });
+    sseEmit(Number(m.user_b_id), "match:finished", { match_id: Number(m.id) });
+  } catch (_) {}
+  return res.json({ success: true, finished: true, current_index: total });
+}
+
 
     // INFO modunda eksikler 'bilmem' ile tamamlanır
     if (String(m.mode) === "info") {
@@ -1979,7 +1897,7 @@ await run(
         [matchId, qid, bId]
       );
 
-      const maxSec = 16;
+      const maxSec = DUELLO_PER_Q_SEC;
       if (!aAns) {
         await run(
           `INSERT INTO duello_answers
@@ -2011,14 +1929,19 @@ await run(
       const isLast  = nextIdx >= Number(m.total_questions);
 
       if (isLast) {
-        await run(
-          `UPDATE duello_matches
-              SET current_index=$2, state='finished', finished_at=timezone('Europe/Istanbul', now())
-            WHERE id=$1`,
-          [matchId, nextIdx]
-        );
-        return res.json({ success: true, finished: true, current_index: nextIdx });
-      }
+  await run(
+    `UPDATE duello_matches
+        SET current_index=$2, state='finished', finished_at=timezone('Europe/Istanbul', now())
+      WHERE id=$1`,
+    [matchId, nextIdx]
+  );
+  try {
+    sseEmit(Number(m.user_a_id), "match:finished", { match_id: Number(m.id) });
+    sseEmit(Number(m.user_b_id), "match:finished", { match_id: Number(m.id) });
+  } catch (_) {}
+  return res.json({ success: true, finished: true, current_index: nextIdx });
+}
+
 
       await run(`UPDATE duello_matches SET current_index=$2 WHERE id=$1`, [matchId, nextIdx]);
       return res.json({ success: true, finished: false, current_index: nextIdx });
