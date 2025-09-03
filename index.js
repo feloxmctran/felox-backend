@@ -259,6 +259,34 @@ async function upsertDailyStreakOnFinish(userId, dayKey) {
   );
 }
 
+/** Dünkü gün bile oynanmadıysa streak’i hemen sıfırla (idempotent) */
+async function decayDailyStreakIfMissed(userId, todayKey) {
+  // hiç kaydı yoksa dokunma
+  const st = await get(
+    `SELECT COALESCE(current_streak,0) AS cur, last_day_key::date AS last
+       FROM user_daily_streak
+      WHERE user_id=$1`,
+    [userId]
+  );
+  if (!st?.last) return;
+
+  // today - last_day_key >= 2  => en az bir TAM “boş gün” kaçırılmış
+  const miss = await get(
+    `SELECT (($1::date - $2::date) >= 2) AS missed`,
+    [todayKey, st.last]
+  );
+
+  if (miss?.missed && (st.cur || 0) > 0) {
+    await run(
+      `UPDATE user_daily_streak
+          SET current_streak = 0
+        WHERE user_id = $1`,
+      [userId]
+    );
+  }
+}
+
+
 /* === YESTERDAY KEY === */
 async function getYesterdayKey() {
   const row = await get(`SELECT to_char(timezone('Europe/Istanbul', now()) - interval '1 day', 'YYYY-MM-DD') AS day`);
@@ -3035,6 +3063,8 @@ app.get("/api/daily/status", async (req, res) => {
     if (!user_id) return res.status(400).json({ error: "user_id zorunlu" });
 
     const dayKey = await getDayKey();
+    await decayDailyStreakIfMissed(user_id, dayKey);
+
     const size = DAILY_CONTEST_SIZE;
 
     const session = await getOrCreateDailySession(user_id, dayKey);
@@ -3099,6 +3129,8 @@ app.post("/api/daily/answer", async (req, res) => {
     const dayKey = await getDayKey();
     const size = DAILY_CONTEST_SIZE;
     const session = await getOrCreateDailySession(user_id, dayKey);
+    await decayDailyStreakIfMissed(user_id, dayKey);
+
     const ids = await getOrCreateDailySetIds(dayKey, size);
 
     // set zaten bitmişse: idempotent streak + dönüş
@@ -3205,6 +3237,8 @@ app.post("/api/daily/skip", async (req, res) => {
     const dayKey = await getDayKey();
     const size = DAILY_CONTEST_SIZE;
     const session = await getOrCreateDailySession(user_id, dayKey);
+    await decayDailyStreakIfMissed(user_id, dayKey);
+
     const ids = await getOrCreateDailySetIds(dayKey, size);
 
     // Set zaten bitmişse: idempotent streak + dönüş
