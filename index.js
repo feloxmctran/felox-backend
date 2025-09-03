@@ -1415,6 +1415,67 @@ try {
   }
 });
 
+// Davet iptali: sadece gönderen (from_user_id) iptal edebilir
+app.post("/api/duello/invite/cancel", async (req, res) => {
+  try {
+    const inviteId = Number(req.body?.invite_id);
+    const userId   = Number(req.body?.user_id);
+    if (!inviteId || !userId) {
+      return res.status(400).json({ error: "invite_id ve user_id zorunlu" });
+    }
+
+    // Süresi geçmiş pending'leri temizle (yarış durumlarını güncel tut)
+    await expireOldInvites();
+
+    const inv = await get(
+      `SELECT id, from_user_id, to_user_id, status
+         FROM duello_invites
+        WHERE id = $1`,
+      [inviteId]
+    );
+    if (!inv) return res.status(404).json({ error: "Davet bulunamadı" });
+
+    if (Number(inv.from_user_id) !== userId) {
+      return res.status(403).json({ error: "Bu daveti iptal etme yetkiniz yok" });
+    }
+
+    // Idempotent davranış: zaten 'cancelled' ise success dön
+    if (inv.status === "cancelled") {
+      try {
+        sseEmit(Number(inv.to_user_id),   "invite:cancelled", { invite_id: inviteId });
+        sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: inviteId });
+      } catch (_) {}
+      return res.json({ success: true, invite: { id: inviteId, status: "cancelled" } });
+    }
+
+    // Pending değilse (accepted/rejected/expired) iptal edilemez
+    if (inv.status !== "pending") {
+      return res.status(409).json({ error: "Davet artık pending değil" });
+    }
+
+    // İptal et
+    const row = await get(
+      `UPDATE duello_invites
+          SET status='cancelled',
+              cancelled_at = timezone('Europe/Istanbul', now())
+        WHERE id=$1 AND status='pending'
+      RETURNING id, status, cancelled_at`,
+      [inviteId]
+    );
+
+    // SSE: hem göndereni hem alıcıyı bilgilendir
+    try {
+      sseEmit(Number(inv.to_user_id),   "invite:cancelled", { invite_id: inviteId });
+      sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: inviteId });
+    } catch (_) {}
+
+    return res.json({ success: true, invite: row });
+  } catch (e) {
+    return res.status(500).json({ error: "Davet iptal edilemedi: " + e.message });
+  }
+});
+
+
 /** Gelen kutusu: pending ve süresi geçmemiş davetler */
 app.get("/api/duello/inbox/:userId", async (req, res) => {
   try {
