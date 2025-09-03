@@ -2680,6 +2680,76 @@ async function duelloMatchTotals(matchId) {
   return map; // { [user_id]: {bilmem, correct, wrong, score} }
 }
 
+// Basit kazanma/kaybetme/beraberlik istatistiği
+// GET /api/duello/user/:id/stats
+app.get("/api/duello/user/:id/stats", async (req, res) => {
+  try {
+    const uid = Number(req.params.id);
+    if (!uid) return res.status(400).json({ success: false, error: "invalid user id" });
+
+    // Bitmiş maçlar üzerinden skorları hesaplayıp W/L/D çıkarıyoruz
+    const row = await get(
+      `
+      WITH scores AS (
+        SELECT
+          m.id,
+          m.user_a_id,
+          m.user_b_id,
+          SUM(
+            CASE
+              WHEN da.user_id = m.user_a_id THEN
+                CASE WHEN da.answer='bilmem' THEN 0
+                     WHEN da.is_correct=1   THEN q.point
+                     ELSE -q.point
+                END
+              ELSE 0
+            END
+          ) AS score_a,
+          SUM(
+            CASE
+              WHEN da.user_id = m.user_b_id THEN
+                CASE WHEN da.answer='bilmem' THEN 0
+                     WHEN da.is_correct=1   THEN q.point
+                     ELSE -q.point
+                END
+              ELSE 0
+            END
+          ) AS score_b
+        FROM duello_matches m
+        JOIN duello_answers da ON da.match_id = m.id
+        JOIN questions q ON q.id = da.question_id
+        WHERE m.state = 'finished'
+          AND (m.user_a_id = $1 OR m.user_b_id = $1)
+        GROUP BY m.id, m.user_a_id, m.user_b_id
+      )
+      SELECT
+        COUNT(*)::int AS played,
+        COUNT(*) FILTER (
+          WHERE (user_a_id=$1 AND score_a>score_b) OR (user_b_id=$1 AND score_b>score_a)
+        )::int AS wins,
+        COUNT(*) FILTER (
+          WHERE (user_a_id=$1 AND score_a<score_b) OR (user_b_id=$1 AND score_b<score_a)
+        )::int AS losses,
+        COUNT(*) FILTER (WHERE score_a=score_b)::int AS draws
+      FROM scores
+      `,
+      [uid]
+    );
+
+    const played = Number(row?.played || 0);
+    const wins   = Number(row?.wins   || 0);
+    const losses = Number(row?.losses || 0);
+    const draws  = Number(row?.draws  || 0);
+
+    return res.json({ success: true, played, wins, losses, draws });
+  } catch (err) {
+    console.error("duello /user/:id/stats error:", err?.message || err);
+    // Hata durumunda bile boş ama geçerli payload dönelim ki FE kırılmasın
+    return res.json({ success: true, played: 0, wins: 0, losses: 0, draws: 0 });
+  }
+});
+
+
 /** Maç özeti: skorlar + kazanan */
 app.get("/api/duello/match/:matchId/summary", async (req, res) => {
   try {
