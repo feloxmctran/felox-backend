@@ -1121,9 +1121,10 @@ async function findUserByIdOrCode({ user_id, user_code }) {
   return null;
 }
 
-// --- Rastgele hazır rakip bulucu (visibility şartı olmadan, sadece ready)
+// --- Rastgele hazır + OYUNDA (SSE açık) rakip bulucu
 async function findRandomReadyOpponent(excludeUserId) {
-  return await get(
+  // Biraz geniş aday listesi çekip, SSE açık olana göre filtrele
+  const candidates = await all(
     `
     SELECT u.id, u.ad, u.soyad, u.user_code
       FROM duello_profiles p
@@ -1136,10 +1137,20 @@ async function findRandomReadyOpponent(excludeUserId) {
             AND (m.user_a_id = u.id OR m.user_b_id = u.id)
        )
      ORDER BY random()
-     LIMIT 1
+     LIMIT 20
     `,
     [excludeUserId]
   );
+
+  // "Oyunda" = bu backend sürecinde SSE bağlantısı açık olan kullanıcı
+  for (const u of candidates) {
+    const uid = Number(u.id);
+    const set = sseClients.get(uid);
+    if (set && set.size > 0) {
+      return u; // SSE'si açık ilk adayı seç
+    }
+  }
+  return null; // O anda oyunda/online kimse yok
 }
 
 // GET: sadece ad-soyad/kod döner (istersen FE’de kullanırsın)
