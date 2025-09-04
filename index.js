@@ -76,6 +76,10 @@ pool
   });
 
 /* ---------- MINI DB HELPERS ---------- */
+function normalizeEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
 async function run(sql, params = []) { await pool.query(sql, params); return { success: true }; }
 async function get(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
@@ -307,6 +311,12 @@ async function init() {
     password TEXT,
     role TEXT
   )`);
+
+await run(`
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_ci
+  ON users (lower(email))
+`);
+
 
 await run(`
   ALTER TABLE users
@@ -717,30 +727,73 @@ async function duelloIdleAbortTick() {
 
 
 /* ---------- AUTH ---------- */
+
+
+app.post("/api/auth/check-email", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).json({ error: "email zorunlu" });
+    const row = await get(`SELECT 1 FROM users WHERE lower(email)=lower($1)`, [email]);
+    res.json({ exists: !!row, normalized: email });
+  } catch {
+    res.status(500).json({ error: "Kontrol edilemedi" });
+  }
+});
+
+app.get("/api/check-email", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+    if (!email) return res.status(400).json({ error: "email zorunlu" });
+    const row = await get(`SELECT 1 FROM users WHERE lower(email)=lower($1)`, [email]);
+    res.json({ exists: !!row });
+  } catch {
+    res.status(500).json({ error: "Kontrol edilemedi" });
+  }
+});
+
+app.get("/api/users/exists", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+    if (!email) return res.status(400).json({ error: "email zorunlu" });
+    const row = await get(`SELECT 1 FROM users WHERE lower(email)=lower($1)`, [email]);
+    res.json({ exists: !!row });
+  } catch {
+    res.status(500).json({ error: "Kontrol edilemedi" });
+  }
+});
+
+
 app.post("/api/register", async (req, res) => {
   try {
     const { ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role } = req.body;
+    const emailNorm = normalizeEmail(email);
+
     await run(
       `INSERT INTO users (ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role]
+      [ad, soyad, yas, cinsiyet, meslek, sehir, emailNorm, password, role]
     );
+
     const user = await get(
-  `SELECT id, ad, soyad, email, role, cinsiyet, user_code FROM users WHERE email=$1`,
-  [email]
-);
+      `SELECT id, ad, soyad, email, role, cinsiyet, user_code
+         FROM users
+        WHERE lower(email)=lower($1)`,
+      [emailNorm]
+    );
 
-if (user && !user.user_code) {
-  user.user_code = await ensureUserCodeForUser(user.id);
-}
-
+    if (user && !user.user_code) {
+      user.user_code = await ensureUserCodeForUser(user.id);
+    }
 
     res.json({ success: true, user });
   } catch (err) {
-    if (String(err.message).includes("duplicate key")) return res.status(400).json({ error: "Bu e-posta zaten kayıtlı." });
+    if (String(err.message).includes("duplicate key")) {
+      return res.status(400).json({ error: "Bu e-posta zaten kayıtlı." });
+    }
     res.status(500).json({ error: "Kayıt başarısız." });
   }
 });
+
 
 app.get("/api/user/:userId/exists", async (req, res) => {
   const user = await get(`SELECT id FROM users WHERE id=$1`, [req.params.userId]);
@@ -750,16 +803,18 @@ app.get("/api/user/:userId/exists", async (req, res) => {
 app.post("/api/login", async (req, res) => {
   try {
     const { email, password } = req.body;
+    const emailNorm = normalizeEmail(email);
+
     const user = await get(
-  `SELECT id, ad, soyad, email, role, cinsiyet, user_code
-   FROM users WHERE email=$1 AND password=$2`,
-  [email, password]
-);
+      `SELECT id, ad, soyad, email, role, cinsiyet, user_code
+         FROM users
+        WHERE lower(email)=lower($1) AND password=$2`,
+      [emailNorm, password]
+    );
 
-if (user && !user.user_code) {
-  user.user_code = await ensureUserCodeForUser(user.id);
-}
-
+    if (user && !user.user_code) {
+      user.user_code = await ensureUserCodeForUser(user.id);
+    }
 
     if (!user) return res.status(401).json({ error: "E-posta veya şifre yanlış." });
     res.json({ success: true, user });
@@ -767,6 +822,7 @@ if (user && !user.user_code) {
     res.status(500).json({ error: "Sunucu hatası." });
   }
 });
+
 
 /* ---------- EDITOR ---------- */
 app.post("/api/surveys", async (req, res) => {
