@@ -28,7 +28,10 @@ app.use(cors({
     if (!origin) return cb(null, true);                 // mobil/webview
     if (!ALLOWED_ORIGINS.length) return cb(null, true); // env boşsa serbest
     return cb(null, ALLOWED_ORIGINS.includes(origin));
-  }
+  },
+  credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
+  exposedHeaders: ["x-request-id"]
 }));
 
 app.use(express.json({ limit: "5mb" }));
@@ -36,7 +39,7 @@ app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 app.use(pinoHttp({
   logger: pino(),
   genReqId: (req, res) => req.id || req.headers['x-request-id'] || crypto.randomUUID(),
-  redact: {
+    redact: {
     paths: [
       'req.headers.authorization',
       'req.headers.cookie',
@@ -45,10 +48,12 @@ app.use(pinoHttp({
       'req.body.secret',
       'req.body.admin_secret',
       'req.body.*.password',     // nested objelerdeki `password` için
-      'req.query.admin_secret'
+      'req.query.admin_secret',  // <— BURAYA VİRGÜL EKLENDİ
+      'req.query.secret'
     ],
     censor: '[REDACTED]'
   }
+
 }));
 
 
@@ -93,14 +98,23 @@ const enumLimiter = rateLimit({
 app.use(['/api/auth/check-email', '/api/check-email', '/api/users/exists'], enumLimiter);
 
 // --- Admin koruması (header, query veya body'den secret) ---
-function requireAdmin(req, res, next) {
+const ADMIN_SECRET = (process.env.ADMIN_SECRET || "").trim();
+
+function isAdminAuthenticated(req) {
   const s =
     req.headers["x-admin-secret"] ||
-    req.query.admin_secret ||
+    req.query?.admin_secret ||
     req.body?.secret ||
     req.body?.admin_secret;
+  return ADMIN_SECRET && s === ADMIN_SECRET;
+}
 
-  if (s && s === process.env.ADMIN_SECRET) return next();
+function requireAdmin(req, res, next) {
+  // Emniyet: ortamda admin anahtarı yoksa admin uçları kapalı
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ error: "Admin kapalı: ADMIN_SECRET tanımlı değil." });
+  }
+  if (isAdminAuthenticated(req)) return next();
   return res.status(403).json({ error: "Yetkisiz" });
 }
 
@@ -128,19 +142,26 @@ function sseEmit(userId, event, payload = {}) {
   const set = sseClients.get(uid);
   if (!set || set.size === 0) return;
 
-  // Named event
-  const named = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
-
-  // Fallback: default "message" event (type alanı ile)
-  const fallback = `data: ${JSON.stringify({ type: event, ...payload })}\n\n`;
+  // Tek tip zarf: her mesajda type + ts
+  const id = Date.now();
+  const dataObj = { type: String(event), ts: new Date().toISOString(), ...payload };
 
   for (const r of set) {
     try {
-      r.write(named);
-      r.write(fallback); // sadece onmessage dinleyen FE için
-    } catch (_) {}
+      if (r.writableEnded || r.destroyed || (r.socket && r.socket.writable === false)) continue;
+
+      // Named event alanı da aynı dataObj'yi taşır
+      r.write(`id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`);
+
+      // Sadece onmessage dinleyenler için fallback — yine aynı dataObj
+      r.write(`id: ${id + 1}\ndata: ${JSON.stringify(dataObj)}\n\n`);
+    } catch (_) {
+      try { r.end(); } catch {}
+    }
   }
 }
+
+
 
 
 
@@ -159,9 +180,27 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
-pool.on("error", (err) => {
-  console.error("PG pool error:", err.message);
+// Her yeni bağlantıda güvenli session ayarları
+pool.on("connect", async (client) => {
+  try {
+    await client.query(`
+      SET application_name = 'felox-backend';
+      SET statement_timeout = '15s';                   -- tek sorgu sunucu tarafı limiti
+      SET idle_in_transaction_session_timeout = '60s'; -- tx içinde boşta kalan bağlantı
+      SET lock_timeout = '5s';                         -- kilit bekleme sınırı
+      SET timezone = 'Europe/Istanbul';
+    `);
+  } catch (e) {
+    console.error("PG session settings fail:", e.message);
+  }
 });
+
+
+pool.on("error", (err) => {
+  console.error("PG pool error:", err?.message || err);
+  });
+
+
 
 pool
   .query("SELECT 1")
@@ -179,6 +218,33 @@ function normalizeEmail(v) {
 async function run(sql, params = []) { await pool.query(sql, params); return { success: true }; }
 async function get(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
+
+/* --- App Settings (KV) --- */
+async function appGetRaw(key) {
+  const row = await get('SELECT value FROM app_settings WHERE key=$1', [key]);
+  return row?.value;
+}
+async function appSetRaw(key, value) {
+  await run(
+    `INSERT INTO app_settings (key, value, updated_at)
+     VALUES ($1, $2::jsonb, timezone('Europe/Istanbul', now()))
+     ON CONFLICT (key) DO UPDATE
+       SET value=EXCLUDED.value, updated_at=timezone('Europe/Istanbul', now())`,
+    [key, JSON.stringify(value)]
+  );
+}
+async function appGetInt(key, fallback) {
+  const v = await appGetRaw(key);
+  const n = (typeof v === 'number') ? v : parseInt(v, 10);
+  return Number.isFinite(n) ? n : parseInt(fallback, 10);
+}
+async function appGetFloat(key, fallback) {
+  const v = await appGetRaw(key);
+  const n = (typeof v === 'number') ? v : parseFloat(v);
+  return Number.isFinite(n) ? n : parseFloat(fallback);
+}
+
+
 // ---- Password helpers (bcrypt + geriye dönük uyum) ----
 function isBcryptHash(s) {
   return typeof s === "string" && (s.startsWith("$2a$") || s.startsWith("$2b$") || s.startsWith("$2y$"));
@@ -243,6 +309,25 @@ const FEATURE_EMAIL_CHECK = process.env.FEATURE_EMAIL_CHECK === "1";
 
 /* ---------- ENV (Günlük Yarışma) ---------- */
 const DAILY_CONTEST_SIZE = Math.max(1, parseInt(process.env.DAILY_CONTEST_SIZE || "128", 10));
+async function getDailyContestSizeFor(dayKey) {
+  // 1) Kalıcı default: admin panelden anında değişsin
+  const def = await appGetRaw('daily_contest_size'); // sayı beklenir (JSONB number ya da "42")
+  const defNum = Number(def);
+  const defaultSize = Number.isFinite(defNum) && defNum > 0
+    ? Math.min(200, Math.max(1, defNum))
+    : DAILY_CONTEST_SIZE; // ENV fallback
+
+  // 2) Günlük tek seferlik override (yalnızca ilgili gün için)
+  const ov = await appGetRaw('daily_contest_size_next');
+  const s  = Number(ov?.size);
+  if (ov && ov.day_key === dayKey && Number.isFinite(s) && s > 0) {
+    return Math.min(200, Math.max(1, s));
+  }
+
+  return defaultSize;
+}
+
+
 const DAILY_CONTEST_SECRET = process.env.DAILY_CONTEST_SECRET || "felox-secret";
 
 /* ---------- ENV (Düello) ---------- */
@@ -255,6 +340,7 @@ const DUELLO_IDLE_ABORT_SEC = Math.max(
 /* ---------- ENV (Düello zamanlama) ---------- */
 const DUELLO_PER_Q_SEC  = Math.max(5, parseInt(process.env.DUELLO_PER_Q_SEC || "16", 10));
 const DUELLO_REVEAL_SEC = Math.max(1, parseInt(process.env.DUELLO_REVEAL_SEC || "3", 10));
+const SSE_RETRY_MS = Math.max(1000, parseInt(process.env.SSE_RETRY_MS || "3000", 10));
 
 
 
@@ -269,11 +355,23 @@ app.get("/api/duello/events/:userId", (req, res) => {
   const uid = Number(req.params.userId);
   if (!uid) return res.status(400).end();
 
-  // SSE başlıkları
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+    // SSE başlıkları
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("Keep-Alive", "timeout=120, max=1000");
   res.setHeader("X-Accel-Buffering", "no"); // proxy buffer kapatma
+
+  // Soket tarafında kopmaları azalt
+  try {
+    req.socket.setTimeout(0);
+    req.socket.setNoDelay(true);
+    req.socket.setKeepAlive(true);
+  } catch {}
+
+
+
+
   // CORS (bazı proxy katmanlarında gerekli olabiliyor)
   const reqOrigin = req.headers.origin || "";
 if (!ALLOWED_ORIGINS.length || !reqOrigin || ALLOWED_ORIGINS.includes(reqOrigin)) {
@@ -291,20 +389,28 @@ if (!ALLOWED_ORIGINS.length || !reqOrigin || ALLOWED_ORIGINS.includes(reqOrigin)
   // Kayda al
   sseAdd(uid, res);
 
-  // Hoş geldin olayı
-  res.write(`event: ready\ndata: {}\n\n`);
+  // Tarayıcıya otomatik yeniden bağlanma öner (ms)
+res.write(`retry: ${SSE_RETRY_MS}\n`);
+
+// Hoş geldin olayı + event id
+const firstId = Date.now();
+res.write(`id: ${firstId}\nevent: ready\ndata: {}\n\n`);
+
 
   // Bağlantıyı canlı tutmak için ping (Render/Vercel timeoutlarını önler)
   const ping = setInterval(() => {
     try { res.write(`: ping ${Date.now()}\n\n`); } catch {}
   }, 25000);
 
-  // Bağlantı kapanınca temizle
-  req.on("close", () => {
-    clearInterval(ping);
-    sseRemove(uid, res);
-    try { res.end(); } catch {}
-  });
+  // Bağlantı kapanınca/abort/error temizle
+const cleanup = () => {
+  clearInterval(ping);
+  sseRemove(uid, res);
+  try { res.end(); } catch {}
+};
+req.on("close", cleanup);
+req.on("aborted", cleanup);
+res.on("error", cleanup);
 });
 
 
@@ -447,6 +553,15 @@ await run(`
   CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_ci
   ON users (lower(email))
 `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key        TEXT PRIMARY KEY,
+      value      JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('Europe/Istanbul', now())
+    )
+  `);
+
 
 
 await run(`
@@ -816,9 +931,39 @@ init()
     const idleSweepMs = 30 * 1000;
     duelloIdleAbortTick();               // bir defa hemen çalıştır
     setInterval(duelloIdleAbortTick, idleSweepMs);
+    // Davet/maç süpürücü (her 60 sn)
+const sweepMs = 60 * 1000;
+setInterval(async () => {
+  try { await expireOldInvites(); } catch {}
+  try {
+    await run(`
+      UPDATE duello_matches
+         SET state='finished',
+             finished_at = timezone('Europe/Istanbul', now())
+       WHERE state='active'
+         AND current_index >= total_questions
+    `);
+  } catch {}
+}, sweepMs);
+
 
   })
   .catch(e => { console.error(e); process.exit(1); });
+
+// Günlük ödül/temizlik scheduler'ı (şimdilik güvenli no-op + hafif temizlik)
+async function awardSchedulerTick() {
+  try {
+    // ileride otomatik “dünkü ilk 3’e kitap” mantığını buraya taşıyabiliriz.
+    // şimdilik sadece log + olası temizlikleri tetikleyelim:
+    console.log("awardSchedulerTick tick");
+    try { await duelloRefreshFinished(); } catch (_) {}
+    try { await expireOldInvites(); } catch (_) {}
+  } catch (e) {
+    console.error("awardSchedulerTick error:", e?.message || e);
+  }
+}
+
+
 
 // --- DUELLO: idle-timeout yardımcı fonksiyon (şimdilik sadece tanımlı) ---
 async function duelloIdleAbortTick() {
@@ -1103,6 +1248,38 @@ app.get("/api/admin/surveys", requireAdmin, async (_req, res) => {
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
 
+// --- Admin Settings KV ---
+// GET /api/admin/settings/:key
+app.get("/api/admin/settings/:key", requireAdmin, async (req, res) => {
+  const { key } = req.params;
+  const value = await appGetRaw(key);
+  res.json({ success: true, key, value });
+});
+
+// POST /api/admin/settings  body: { key, value }
+app.post("/api/admin/settings", requireAdmin, async (req, res) => {
+  const { key, value } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  await appSetRaw(key, value);
+  res.json({ success: true, key, value });
+});
+
+// YARIN için tek seferlik günlük soru sayısı override
+// POST /api/admin/daily/contest-size-next  body: { size: number }
+app.post("/api/admin/daily/contest-size-next", requireAdmin, async (req, res) => {
+  const size = parseInt(req.body?.size, 10);
+  if (!Number.isFinite(size) || size < 1 || size > 200) {
+    return res.status(400).json({ error: "size 1-200 arası olmalı" });
+  }
+  const row = await get(
+    `SELECT to_char(timezone('Europe/Istanbul', now()) + interval '1 day', 'YYYY-MM-DD') AS day`
+  );
+  const tomorrowKey = row?.day;
+  await appSetRaw('daily_contest_size_next', { day_key: tomorrowKey, size });
+  res.json({ success: true, day_key: tomorrowKey, size });
+});
+
+
 app.post("/api/surveys/:surveyId/status", requireAdmin, async (req, res) => {
   const { status } = req.body;
   if (!["approved", "rejected"].includes(status)) return res.status(400).json({ error: "Geçersiz durum!" });
@@ -1349,6 +1526,7 @@ async function expireOldInvites() {
 
 /** Kullanıcının aktif maçı var mı? (tek aktif maç kuralı) */
 async function hasActiveMatch(userId) {
+  await duelloRefreshFinished(); // stale kayıtları kapat
   const row = await get(
     `SELECT 1
        FROM duello_matches
@@ -1359,6 +1537,7 @@ async function hasActiveMatch(userId) {
   );
   return !!row;
 }
+
 
 /** İki kullanıcı arasında açık (süresi dolmamış) davet var mı? */
 async function hasFreshPendingInvite(a, b) {
@@ -1394,6 +1573,7 @@ async function findUserByIdOrCode({ user_id, user_code }) {
 
 // --- Rastgele hazır + OYUNDA (SSE açık) rakip bulucu
 async function findRandomReadyOpponent(excludeUserId) {
+  await duelloRefreshFinished();
   // Biraz geniş aday listesi çekip, SSE açık olana göre filtrele
   const candidates = await all(
     `
@@ -1469,13 +1649,7 @@ app.post("/api/duello/invite", async (req, res) => {
     await expireOldInvites();
 
 // ... /api/duello/invite içinde, hasActiveMatch() kontrollerinden ÖNCE:
-await run(`
-  UPDATE duello_matches
-     SET state='finished', finished_at = timezone('Europe/Istanbul', now())
-   WHERE state = 'active'
-     AND current_index >= total_questions
-`);
-
+await duelloRefreshFinished();
 
     // tek aktif maç kuralı
     if (await hasActiveMatch(fromId)) return res.status(409).json({ error: "Gönderenin aktif düellosu var" });
@@ -1503,11 +1677,31 @@ try {
     `SELECT id, ad, soyad, user_code FROM users WHERE id=$1`,
     [fromId]
   );
-  sseEmit(toId, "invite:new", {
-    invite: inv,
-    from: fromUser || { id: fromId },
+
+  const invitePayload = {
+    id: Number(inv.id),
+    from_user_id: Number(inv.from_user_id),
+    to_user_id: Number(inv.to_user_id),
+    mode: String(inv.mode),
+    status: "pending",
+    expire_at: inv.expire_at ? new Date(inv.expire_at).toISOString() : null
+  };
+
+  const fromPayload = fromUser
+    ? {
+        id: Number(fromUser.id),
+        ad: fromUser.ad,
+        soyad: fromUser.soyad,
+        user_code: fromUser.user_code
+      }
+    : { id: Number(fromId) };
+
+  sseEmit(Number(toId), "invite:new", {
+    invite: invitePayload,
+    from: fromPayload
   });
 } catch (_) { /* sessiz geç */ }
+
 
 
     return res.json({ success: true, invite: inv });
@@ -1541,35 +1735,71 @@ app.post("/api/duello/invite/respond", async (req, res) => {
       [inviteId]
     );
     if (!inv) return res.status(404).json({ error: "Davet bulunamadı" });
-    if (Number(inv.to_user_id) !== userId) return res.status(403).json({ error: "Bu daveti yanıtlama yetkiniz yok" });
-    if (inv.status !== "pending") return res.status(409).json({ error: "Davet artık pending değil" });
+if (Number(inv.to_user_id) !== userId) return res.status(403).json({ error: "Bu daveti yanıtlama yetkiniz yok" });
 
-    // süresi geçti mi?
-    const expired = await get(
-      `SELECT (expire_at <= timezone('Europe/Istanbul', now())) AS exp FROM duello_invites WHERE id=$1`,
-      [inviteId]
+// --- İDEMPOTENT ACCEPT: davet zaten accepted ise mevcut maçı döndür ---
+if (action === "accept") {
+  if (inv.status === "accepted" && inv.match_id) {
+    const match = await get(
+      `SELECT id, mode, user_a_id, user_b_id, state, total_questions
+         FROM duello_matches
+        WHERE id=$1`,
+      [inv.match_id]
     );
-    if (expired?.exp) {
-      await run(`UPDATE duello_invites SET status='expired' WHERE id=$1`, [inviteId]);
-      return res.status(410).json({ error: "Davetin süresi dolmuş" });
-    }
+    return res.json({
+      success: true,
+      invite: { id: inviteId, status: "accepted" },
+      match
+    });
+  }
+  if (inv.status === "expired") {
+    return res.status(410).json({ error: "Davetin süresi dolmuş" });
+  }
+  if (inv.status === "rejected" || inv.status === "cancelled") {
+    return res.status(409).json({ error: "Davet artık pending değil" });
+  }
+}
 
-    if (action === "reject") {
-      const row = await get(
-        `UPDATE duello_invites
-            SET status='rejected', rejected_at=timezone('Europe/Istanbul', now())
-          WHERE id=$1
-        RETURNING id, status, rejected_at`,
-        [inviteId]
-      );
+// --- REJECT için idempotent davranış: zaten rejected ise success döndür ---
+if (action === "reject" && inv.status !== "pending") {
+  if (inv.status === "rejected") {
+    return res.json({ success: true, invite: { id: inviteId, status: "rejected" } });
+  }
+  if (inv.status === "expired") {
+    return res.status(410).json({ error: "Davetin süresi dolmuş" });
+  }
+  return res.status(409).json({ error: "Davet artık pending değil" });
+}
 
-      // --- SSE: gönderene davetin reddedildiğini bildir
-try {
-  sseEmit(inv.from_user_id, "invite:rejected", { invite_id: inviteId });
-} catch (_) {}
+// süresi geçti mi? (halen pending ise expire et)
+if (inv.status === "pending") {
+  const expired = await get(
+    `SELECT (expire_at <= timezone('Europe/Istanbul', now())) AS exp FROM duello_invites WHERE id=$1`,
+    [inviteId]
+  );
+  if (expired?.exp) {
+    await run(`UPDATE duello_invites SET status='expired' WHERE id=$1`, [inviteId]);
+    return res.status(410).json({ error: "Davetin süresi dolmuş" });
+  }
+}
 
-      return res.json({ success: true, invite: row });
-    }
+// REJECT akışı (hala pending ise)
+if (action === "reject") {
+  const row = await get(
+    `UPDATE duello_invites
+        SET status='rejected', rejected_at=timezone('Europe/Istanbul', now())
+      WHERE id=$1 AND status='pending'
+    RETURNING id, status, rejected_at`,
+    [inviteId]
+  );
+
+  // --- SSE: gönderene bildir
+  try { sseEmit(Number(inv.from_user_id), "invite:rejected", { invite_id: Number(inviteId) });
+ } catch (_) {}
+
+  return res.json({ success: true, invite: row || { id: inviteId, status: "rejected" } });
+}
+
 
         // ACCEPT
     const fromId = Number(inv.from_user_id);
@@ -1620,6 +1850,17 @@ try {
         return res.status(410).json({ error: "Davetin süresi dolmuş" });
       }
 
+      // İki taraf için 'bitmiş' olduğu halde active kalan maçları kapat
+      await client.query(`
+        UPDATE duello_matches
+           SET state='finished',
+               finished_at = timezone('Europe/Istanbul', now())
+         WHERE state='active'
+           AND current_index >= total_questions
+           AND (user_a_id IN ($1,$2) OR user_b_id IN ($1,$2))
+      `, [fromId, toId]);
+
+
       // Tek aktif maç kuralını tx içinde kontrol et
       const actA = await client.query(
         `SELECT 1 FROM duello_matches
@@ -1641,19 +1882,21 @@ try {
       }
 
       // Maçı oluştur
+      const TOTAL_Q = await appGetInt('duel_questions_per_match', 12);
       const matchIns = await client.query(
-        `INSERT INTO duello_matches
-          (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
-           last_seen_a, last_seen_b, last_activity_at)
-         VALUES
-          ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', 12, 0,
-           timezone('Europe/Istanbul', now()),
-           timezone('Europe/Istanbul', now()),
-           timezone('Europe/Istanbul', now()))
-         RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
-        [lockedInv.mode, fromId, toId]
-      );
-      const match = matchIns.rows[0];
+  `INSERT INTO duello_matches
+    (mode, user_a_id, user_b_id, created_at, state, total_questions, current_index,
+     last_seen_a, last_seen_b, last_activity_at)
+   VALUES
+    ($1,$2,$3, timezone('Europe/Istanbul', now()), 'active', $4, 0,
+     timezone('Europe/Istanbul', now()),
+     timezone('Europe/Istanbul', now()),
+     timezone('Europe/Istanbul', now()))
+   RETURNING id, mode, user_a_id, user_b_id, state, total_questions`,
+  [lockedInv.mode, fromId, toId, TOTAL_Q]
+);
+  
+const match = matchIns.rows[0];
 
       // Daveti accepted yap + match_id ekle
       await client.query(
@@ -1680,8 +1923,8 @@ try {
 
       // SSE (tx dışı)
       try {
-        sseEmit(fromId, "invite:accepted", { invite_id: inviteId, match_id: match.id });
-        sseEmit(toId,   "invite:accepted", { invite_id: inviteId, match_id: match.id });
+        sseEmit(Number(fromId), "invite:accepted", { invite_id: Number(inviteId), match_id: Number(match.id) });
+sseEmit(Number(toId),   "invite:accepted", { invite_id: Number(inviteId), match_id: Number(match.id) });
       } catch (_) {}
 
       return res.json({ success: true, invite: { id: inviteId, status: 'accepted' }, match });
@@ -1724,8 +1967,9 @@ app.post("/api/duello/invite/cancel", async (req, res) => {
     // Idempotent davranış: zaten 'cancelled' ise success dön
     if (inv.status === "cancelled") {
       try {
-        sseEmit(Number(inv.to_user_id),   "invite:cancelled", { invite_id: inviteId });
-        sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: inviteId });
+        sseEmit(Number(inv.to_user_id),   "invite:cancelled", { invite_id: Number(inviteId) });
+sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: Number(inviteId) });
+
       } catch (_) {}
       return res.json({ success: true, invite: { id: inviteId, status: "cancelled" } });
     }
@@ -1747,8 +1991,9 @@ app.post("/api/duello/invite/cancel", async (req, res) => {
 
     // SSE: hem göndereni hem alıcıyı bilgilendir
     try {
-      sseEmit(Number(inv.to_user_id),   "invite:cancelled", { invite_id: inviteId });
-      sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: inviteId });
+      sseEmit(Number(inv.to_user_id),   "invite:cancelled", { invite_id: Number(inviteId) });
+sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: Number(inviteId) });
+
     } catch (_) {}
 
     return res.json({ success: true, invite: row });
@@ -1821,6 +2066,15 @@ app.get("/api/duello/active/:userId", async (req, res) => {
   try {
     const uid = Number(req.params.userId);
     if (!uid) return res.status(400).json({ error: "userId zorunlu" });
+    // Bitmiş ama 'active' kalan maçları kapat
+    await run(`
+      UPDATE duello_matches
+         SET state='finished',
+             finished_at = timezone('Europe/Istanbul', now())
+       WHERE state='active'
+         AND current_index >= total_questions
+    `);
+    await duelloRefreshFinished();
 
     const row = await get(
       `SELECT id
@@ -1955,6 +2209,24 @@ function normalizeDuelloAnswer(mode, raw) {
   return s;
 }
 
+/** Active görünüp fiilen bitmiş maçları 'finished' yapar (idempotent) */
+async function duelloRefreshFinished() {
+  await run(`
+    UPDATE duello_matches
+       SET state = 'finished',
+           finished_at = COALESCE(finished_at, timezone('Europe/Istanbul', now()))
+     WHERE state = 'active'
+       AND current_index >= total_questions
+  `);
+}
+
+
+/** Maç gerçekten bitti mi? (finished | abandoned | soru sayısı bitti) */
+function duelloIsOver(m) {
+  return String(m.state) !== 'active'
+      || Number(m.current_index) >= Number(m.total_questions);
+}
+
 /* ——— STATUS ——— */
 /**
  * Maç durumunu döner: soru seti, aktif soru, verilen cevaplar, skorlar.
@@ -1988,29 +2260,45 @@ await run(
     const scores = await duelloScores(matchId, aId, bId);
 
     // Bitmiş mi?
-    if (m.state === "finished" || Number(m.current_index) >= Number(m.total_questions)) {
-      const finished = {
-        success: true,
-        finished: true,
-        match: {
-          id: m.id, mode: m.mode, total_questions: m.total_questions,
-          user_a_id: aId, user_b_id: bId, state: "finished"
-        },
-        scores
-      };
-      return res.json(finished);
-    }
+    // Bitmiş mi?
+if (duelloIsOver(m)) {
+  return res.json({
+    success: true,
+    finished: true,
+    match: {
+      id: m.id,
+      mode: m.mode,
+      user_a_id: aId,
+      user_b_id: bId,
+      total_questions: Number(m.total_questions),
+      current_index: Number(m.current_index),
+      state: String(m.state) // 'finished' veya 'abandoned' ise aynen döner
+    },
+    scores
+  });
+}
+
 
     const currentPos = Number(m.current_index) + 1;
     const qid = await duelloGetQuestionIdByPos(m.id, currentPos);
-    if (!qid) {
-      return res.json({
-        success: true,
-        finished: true,
-        match: { id: m.id, mode: m.mode, total_questions: m.total_questions, state: "finished" },
-        scores
-      });
-    }
+if (!qid) {
+  // Set hatalıysa bile tek tip finished cevabı verelim; state'i zorlamayalım
+  return res.json({
+    success: true,
+    finished: true,
+    match: {
+      id: m.id,
+      mode: m.mode,
+      user_a_id: aId,
+      user_b_id: bId,
+      total_questions: Number(m.total_questions),
+      current_index: Number(m.current_index),
+      state: String(m.state)
+    },
+    scores
+  });
+}
+
 
     const q = await get(
       `SELECT q.id, q.question, q.point, q.survey_id, s.title AS survey_title
@@ -2563,6 +2851,15 @@ const LADDER_MIN_ATTEMPTS = Number(process.env.LADDER_MIN_ATTEMPTS ?? 10); // va
 const LADDER_REQUIRED_RATE = Number(process.env.LADDER_REQUIRED_RATE || 0.8); // %80 başarı
 const LADDER_DEFAULT_LIMIT = Math.max(1, parseInt(process.env.LADDER_QUESTIONS_LIMIT || "20", 10));
 
+async function getLadderConfig() {
+  return {
+    minAttempts: await appGetInt('ladder_min_attempts', LADDER_MIN_ATTEMPTS),
+    requiredRate: await appGetFloat('ladder_required_rate', LADDER_REQUIRED_RATE),
+    questionsLimit: await appGetInt('ladder_questions_limit', LADDER_DEFAULT_LIMIT)
+  };
+}
+
+
 // En iyi (erişilen) seviye günceller
 async function bumpLadderBest(userId, level) {
   const safe = Math.max(0, Math.min(10, Number(level) || 0));
@@ -2646,7 +2943,9 @@ app.get("/api/user/:userId/kademeli-questions", async (req, res) => {
   try {
     const userId = Number(req.params.userId);
     const point = Number(req.query.point || 1);
-    const limit = Math.min(1000, Math.max(10, Number(req.query.limit || LADDER_DEFAULT_LIMIT)));
+    const cfg = await getLadderConfig();
+const limit = Math.min(1000, Math.max(10, Number(req.query.limit || cfg.questionsLimit)));
+
     if (!point || point < 1 || point > 10) {
       return res.status(400).json({ error: "Geçersiz point. 1-10 arası olmalı." });
     }
@@ -2715,14 +3014,16 @@ app.get("/api/user/:userId/kademeli-progress", async (req, res) => {
     const correct  = Number(st.correct  || 0);
     const success_rate = attempts > 0 ? (correct / attempts) : 0;
 
-    return res.json({
-      success: true,
-      point,
-      attempted: attempts, // FE eski alan adı
-      correct,
-      success_rate,
-      can_level_up: (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE)
-    });
+    const cfg = await getLadderConfig();
+return res.json({
+  success: true,
+  point,
+  attempted: attempts,
+  correct,
+  success_rate,
+  can_level_up: (attempts >= cfg.minAttempts && success_rate >= cfg.requiredRate)
+});
+
 
   } catch (e) {
     console.error(e);
@@ -2771,7 +3072,9 @@ app.get("/api/user/:userId/kademeli-next", async (req, res) => {
     const attempts = Number(st.attempts || 0);
     const correct  = Number(st.correct  || 0);
     const success_rate = attempts > 0 ? (correct / attempts) : 0;
-    const ok = (attempts >= LADDER_MIN_ATTEMPTS && success_rate >= LADDER_REQUIRED_RATE);
+    const cfg = await getLadderConfig();
+const ok = (attempts >= cfg.minAttempts && success_rate >= cfg.requiredRate);
+
 
     if (ok) {
       const next = (point >= 10) ? 10 : (point + 1);
@@ -3308,7 +3611,8 @@ app.get("/api/daily/status", async (req, res) => {
     const dayKey = await getDayKey();
     await decayDailyStreakIfMissed(user_id, dayKey);
 
-    const size = DAILY_CONTEST_SIZE;
+    const size = await getDailyContestSizeFor(dayKey);
+
 
     const session = await getOrCreateDailySession(user_id, dayKey);
     const idx = Math.max(0, Number(session.current_index || 0));
@@ -3370,7 +3674,7 @@ app.post("/api/daily/answer", async (req, res) => {
     }
 
     const dayKey = await getDayKey();
-    const size = DAILY_CONTEST_SIZE;
+    const size = await getDailyContestSizeFor(dayKey);
     const session = await getOrCreateDailySession(user_id, dayKey);
     await decayDailyStreakIfMissed(user_id, dayKey);
 
@@ -3478,7 +3782,7 @@ app.post("/api/daily/skip", async (req, res) => {
     }
 
     const dayKey = await getDayKey();
-    const size = DAILY_CONTEST_SIZE;
+    const size = await getDailyContestSizeFor(dayKey);
     const session = await getOrCreateDailySession(user_id, dayKey);
     await decayDailyStreakIfMissed(user_id, dayKey);
 
@@ -3839,9 +4143,10 @@ app.get("/api/admin/statistics", requireAdmin, async (_req, res) => {
   } catch { res.status(500).json({ error: "İstatistik hatası!" }); }
 });
 
+/* ---------- LEADERBOARDS & STATS ---------- */
 app.get("/api/leaderboard", async (req, res) => {
   try {
-    const period = req.query.period || "all";
+    const period = String(req.query.period || "all");
     const periodClause = periodSql(period, "a");
 
     const rows = await all(
@@ -3870,159 +4175,18 @@ app.get("/api/leaderboard", async (req, res) => {
           END
         ), 0) != 0
       ORDER BY total_points DESC, u.id ASC
+      LIMIT 100
       `
     );
+
     res.json({ success: true, leaderboard: rows });
-  } catch {
-    res.status(500).json({ error: "Liste alınamadı" });
-  }
-});
-
-app.get("/api/user/:userId/rank", async (req, res) => {
-  try {
-    const userId = req.params.userId;
-    const period = req.query.period || "all";
-    const periodClause = periodSql(period, "a");
-
-    const rows = await all(
-      `
-      SELECT u.id,
-        COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ), 0)::int AS total_points
-      FROM users u
-      LEFT JOIN answers a ON a.user_id = u.id
-      LEFT JOIN questions q ON a.question_id = q.id
-      WHERE 1=1
-        ${periodClause}
-      GROUP BY u.id
-      ORDER BY total_points DESC, u.id ASC
-      `
-    );
-
-    const rank = rows.findIndex(r => String(r.id) === String(userId)) + 1;
-    const total_users = rows.length;
-    const user_points = rank > 0 ? rows[rank - 1].total_points : 0;
-    res.json({ success: true, rank, total_users, user_points });
-  } catch {
-    res.status(500).json({ error: "Sıralama alınamadı" });
-  }
-});
-
-app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
-  try {
-    const surveyId = req.params.surveyId;
-    const period = req.query.period || "all";
-    const periodClause = periodSql(period, "a");
-
-    const rows = await all(
-      `
-      SELECT u.id, u.ad, u.soyad,
-        COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ), 0)::int AS total_points
-      FROM users u
-      INNER JOIN answers a ON a.user_id = u.id
-      INNER JOIN questions q ON a.question_id = q.id
-      WHERE 1=1
-        ${periodClause}
-        AND a.question_id IN (SELECT id FROM questions WHERE survey_id = $1)
-      GROUP BY u.id
-      HAVING COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ), 0) != 0
-      ORDER BY total_points DESC, u.id ASC
-      `,
-      [surveyId]
-    );
-    res.json({ success: true, leaderboard: rows });
-  } catch {
-    res.status(500).json({ error: "Anket leaderboard alınamadı!" });
-  }
-});
-
-/* === AWARD SCHEDULER === */
-let lastAwardedFor = null;
-
-async function awardSchedulerTick() {
-  try {
-    const yKey = await getYesterdayKey();
-    if (!yKey) return;
-
-    if (lastAwardedFor === yKey) return;
-
-    const already = await get(`SELECT 1 FROM book_awards WHERE day_key=$1 LIMIT 1`, [yKey]);
-    if (already) { lastAwardedFor = yKey; return; }
-
-    const winners = await all(
-      `
-      SELECT
-        u.id,
-        COALESCE(SUM(
-          CASE
-            WHEN a.answer = 'bilmem' THEN 0
-            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
-            WHEN a.is_correct = 0 THEN -q.point
-            ELSE 0
-          END
-        ),0)::int AS total_points,
-        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS time_spent
-      FROM users u
-      INNER JOIN answers a ON a.user_id = u.id
-      INNER JOIN questions q ON q.id = a.question_id
-      WHERE a.is_daily = true
-        AND a.daily_key = $1
-      GROUP BY u.id
-      HAVING COUNT(a.*) > 0
-      ORDER BY total_points DESC, time_spent ASC, u.id ASC
-      LIMIT 3
-      `,
-      [yKey]
-    );
-
-    const prizes = [5, 3, 1];
-
-    for (let i = 0; i < winners.length; i++) {
-      const u = winners[i];
-      const amount = prizes[i] || 0;
-      if (amount <= 0) continue;
-
-      const ins = await get(
-        `INSERT INTO book_awards (user_id, day_key, rank, amount)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (user_id, day_key) DO NOTHING
-         RETURNING 1 AS ok`,
-        [u.id, yKey, i + 1, amount]
-      );
-
-      if (ins?.ok) {
-        await run(`UPDATE users SET books = COALESCE(books,0) + $1 WHERE id=$2`, [amount, u.id]);
-        console.log("Ödül verildi:", yKey, "user", u.id, "rank", i + 1, "amount", amount);
-      }
-    }
-
-    lastAwardedFor = yKey;
   } catch (e) {
-    console.error("awardSchedulerTick hata:", e.message);
+    console.error("/api/leaderboard fail:", e);
+    res.status(500).json({ error: "Leaderboard alınamadı" });
   }
-}
+});
 
-// Global error handler (tüm route'lardan sonra)
+/* ---------- GLOBAL ERROR HANDLER & SHUTDOWN ---------- */
 app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ error: "Sunucu hatası." });
@@ -4031,8 +4195,10 @@ app.use((err, _req, res, _next) => {
 process.on("unhandledRejection", (r) => console.error("UNHANDLED REJECTION:", r));
 process.on("uncaughtException", (e) => { console.error("UNCAUGHT EXCEPTION:", e); });
 
+async function awardSchedulerTick() {
+  // Şimdilik no-op; zamanlanmış ödül işleri eklenirse burada çalışacak.
+}
 
-/* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend http://0.0.0.0:${PORT} üzerinde çalışıyor`);
