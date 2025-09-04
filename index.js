@@ -1,15 +1,111 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const bodyParser = require("body-parser");
 const { Pool } = require("pg");
 const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || "10", 10);
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const pino = require("pino");
+const pinoHttp = require("pino-http");
+
 
 
 const app = express();
-app.use(cors());
+app.disable("x-powered-by");
+
+// reverse proxy arkasında gerçek IP için
+app.set("trust proxy", 1);
+
+// İzinli origin'ler (ENV: ALLOWED_ORIGINS="https://felox.app,https://www.felox.app")
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
+app.use(helmet());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);                 // mobil/webview
+    if (!ALLOWED_ORIGINS.length) return cb(null, true); // env boşsa serbest
+    return cb(null, ALLOWED_ORIGINS.includes(origin));
+  }
+}));
+
 app.use(express.json({ limit: "5mb" }));
-app.use(bodyParser.urlencoded({ extended: true, limit: "5mb" }));
+app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+app.use(pinoHttp({
+  logger: pino(),
+  genReqId: (req, res) => req.id || req.headers['x-request-id'] || crypto.randomUUID(),
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'req.headers.cookie',
+      'req.headers["x-admin-secret"]',
+      'req.body.password',
+      'req.body.secret',
+      'req.body.admin_secret',
+      'req.body.*.password',     // nested objelerdeki `password` için
+      'req.query.admin_secret'
+    ],
+    censor: '[REDACTED]'
+  }
+}));
+
+
+
+// Genel hafif limit
+const softLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(softLimiter);
+
+// Kimlik ve kritik işlemler
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(['/api/login', '/api/register', '/api/account/delete'], authLimiter);
+
+// Düello aksiyonları
+const duelLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(
+  ['/api/duello/invite', '/api/duello/invite/respond', '/api/duello/invite/cancel', '/api/duello/match'],
+  duelLimiter
+);
+
+// Email enumeration uçları
+const enumLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(['/api/auth/check-email', '/api/check-email', '/api/users/exists'], enumLimiter);
+
+// --- Admin koruması (header, query veya body'den secret) ---
+function requireAdmin(req, res, next) {
+  const s =
+    req.headers["x-admin-secret"] ||
+    req.query.admin_secret ||
+    req.body?.secret ||
+    req.body?.admin_secret;
+
+  if (s && s === process.env.ADMIN_SECRET) return next();
+  return res.status(403).json({ error: "Yetkisiz" });
+}
+
+
+
 // === SSE (Server-Sent Events) — duello bildirimleri ===
 const sseClients = new Map(); // Map<userId:number, Set<res>>
 
@@ -83,6 +179,30 @@ function normalizeEmail(v) {
 async function run(sql, params = []) { await pool.query(sql, params); return { success: true }; }
 async function get(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
 async function all(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
+// ---- Password helpers (bcrypt + geriye dönük uyum) ----
+function isBcryptHash(s) {
+  return typeof s === "string" && (s.startsWith("$2a$") || s.startsWith("$2b$") || s.startsWith("$2y$"));
+}
+
+async function hashPassword(plain) {
+  return await bcrypt.hash(String(plain), BCRYPT_ROUNDS);
+}
+
+async function verifyPassword(plain, stored) {
+  if (!stored) return false;
+  if (isBcryptHash(stored)) return await bcrypt.compare(String(plain), stored);
+  // Eski düz-metni destekle (migrasyon dönemi)
+  return String(plain) === String(stored);
+}
+
+async function maybeUpgradePassword(userId, plain, stored) {
+  if (isBcryptHash(stored)) return; // zaten bcrypt
+  try {
+    const hashed = await hashPassword(plain);
+    await run(`UPDATE users SET password=$2 WHERE id=$1`, [userId, hashed]);
+  } catch (_) {}
+}
+
 
 function randomReadableCode(len = 6) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // O, I, 0, 1 yok
@@ -116,6 +236,9 @@ async function ensureUserCodeForUser(userId) {
   const last = await get(`SELECT user_code FROM users WHERE id=$1`, [userId]);
   return last?.user_code || null;
 }
+
+// E-posta var mı? uçlarını kapatmak/açmak için
+const FEATURE_EMAIL_CHECK = process.env.FEATURE_EMAIL_CHECK === "1";
 
 
 /* ---------- ENV (Günlük Yarışma) ---------- */
@@ -152,7 +275,15 @@ app.get("/api/duello/events/:userId", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no"); // proxy buffer kapatma
   // CORS (bazı proxy katmanlarında gerekli olabiliyor)
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const reqOrigin = req.headers.origin || "";
+if (!ALLOWED_ORIGINS.length || !reqOrigin || ALLOWED_ORIGINS.includes(reqOrigin)) {
+  res.setHeader("Access-Control-Allow-Origin", reqOrigin || "*");
+  res.setHeader("Vary", "Origin");
+} else {
+  return res.status(403).end();
+}
+
+
 
   // İlk flush (varsa)
   try { res.flushHeaders?.(); } catch {}
@@ -730,6 +861,8 @@ async function duelloIdleAbortTick() {
 
 
 app.post("/api/auth/check-email", async (req, res) => {
+    if (!FEATURE_EMAIL_CHECK) return res.status(404).json({ error: "Not found" });
+
   try {
     const email = normalizeEmail(req.body?.email);
     if (!email) return res.status(400).json({ error: "email zorunlu" });
@@ -741,6 +874,8 @@ app.post("/api/auth/check-email", async (req, res) => {
 });
 
 app.get("/api/check-email", async (req, res) => {
+    if (!FEATURE_EMAIL_CHECK) return res.status(404).json({ error: "Not found" });
+
   try {
     const email = normalizeEmail(req.query.email);
     if (!email) return res.status(400).json({ error: "email zorunlu" });
@@ -752,6 +887,8 @@ app.get("/api/check-email", async (req, res) => {
 });
 
 app.get("/api/users/exists", async (req, res) => {
+    if (!FEATURE_EMAIL_CHECK) return res.status(404).json({ error: "Not found" });
+
   try {
     const email = normalizeEmail(req.query.email);
     if (!email) return res.status(400).json({ error: "email zorunlu" });
@@ -762,24 +899,27 @@ app.get("/api/users/exists", async (req, res) => {
   }
 });
 
-
 app.post("/api/register", async (req, res) => {
   try {
     const { ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role } = req.body;
-    const emailNorm = normalizeEmail(email);
+const emailNorm = normalizeEmail(email);
+if (!emailNorm || !password) {
+  return res.status(400).json({ error: "email ve password zorunlu." });
+}
+const hashed = await hashPassword(password);
+await run(
+  `INSERT INTO users (ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+  [ad, soyad, yas, cinsiyet, meslek, sehir, emailNorm, hashed, role]
+);
 
-    await run(
-      `INSERT INTO users (ad, soyad, yas, cinsiyet, meslek, sehir, email, password, role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [ad, soyad, yas, cinsiyet, meslek, sehir, emailNorm, password, role]
-    );
+const user = await get(
+  `SELECT id, ad, soyad, email, role, cinsiyet, user_code
+     FROM users
+    WHERE lower(email)=lower($1)`,
+  [emailNorm]
+);
 
-    const user = await get(
-      `SELECT id, ad, soyad, email, role, cinsiyet, user_code
-         FROM users
-        WHERE lower(email)=lower($1)`,
-      [emailNorm]
-    );
 
     if (user && !user.user_code) {
       user.user_code = await ensureUserCodeForUser(user.id);
@@ -805,12 +945,28 @@ app.post("/api/login", async (req, res) => {
     const { email, password } = req.body;
     const emailNorm = normalizeEmail(email);
 
-    const user = await get(
-      `SELECT id, ad, soyad, email, role, cinsiyet, user_code
-         FROM users
-        WHERE lower(email)=lower($1) AND password=$2`,
-      [emailNorm, password]
-    );
+    const row = await get(
+  `SELECT id, ad, soyad, email, role, cinsiyet, user_code, password
+     FROM users
+    WHERE lower(email)=lower($1)`,
+  [emailNorm]
+);
+
+
+if (!row) return res.status(401).json({ error: "E-posta veya şifre yanlış." });
+
+const ok = await verifyPassword(password, row.password);
+if (!ok) return res.status(401).json({ error: "E-posta veya şifre yanlış." });
+
+// Eski düz-metinden bcrypt'e sessiz geçiş
+await maybeUpgradePassword(row.id, password, row.password);
+
+// response'a parolayı koyma
+const user = {
+  id: row.id, ad: row.ad, soyad: row.soyad, email: row.email,
+  role: row.role, cinsiyet: row.cinsiyet, user_code: row.user_code
+};
+
 
     if (user && !user.user_code) {
       user.user_code = await ensureUserCodeForUser(user.id);
@@ -820,6 +976,36 @@ app.post("/api/login", async (req, res) => {
     res.json({ success: true, user });
   } catch {
     res.status(500).json({ error: "Sunucu hatası." });
+  }
+});
+
+// Hesap silme (hard delete): body: { email, password }
+app.post("/api/account/delete", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+const emailNorm = normalizeEmail(email);
+if (!emailNorm || !password) {
+  return res.status(400).json({ error: "email ve password zorunlu." });
+}
+
+
+    const u = await get(
+  `SELECT id, email, password FROM users WHERE lower(email)=lower($1)`,
+  [emailNorm]
+);
+
+    if (!u) return res.status(404).json({ error: "Kullanıcı bulunamadı." });
+
+    const ok = await verifyPassword(password, u.password);
+    if (!ok) return res.status(401).json({ error: "Kimlik doğrulaması başarısız." });
+
+    // ON DELETE CASCADE ile tüm ilişkili kayıtlar silinecek
+    await run(`DELETE FROM users WHERE id=$1`, [u.id]);
+
+    return res.json({ success: true, message: "Hesabın ve ilişkili verilerin silindi." });
+  } catch (e) {
+    console.error("account/delete fail:", e.message);
+    return res.status(500).json({ error: "Hesap silinemedi." });
   }
 });
 
@@ -898,12 +1084,13 @@ app.get("/api/surveys/:surveyId/questions", async (req, res) => {
   }
 });
 
-app.post("/api/surveys/:surveyId/delete", async (req, res) => {
+app.post("/api/surveys/:surveyId/delete", requireAdmin, async (req, res) => {
   try { await run(`UPDATE surveys SET status='deleted' WHERE id=$1`, [req.params.surveyId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Silinemedi." }); }
 });
 
-app.get("/api/admin/surveys", async (_req, res) => {
+app.get("/api/admin/surveys", requireAdmin, async (_req, res) => {
+
   try {
     const rows = await all(
       `SELECT surveys.*, users.ad as editor_ad, users.soyad as editor_soyad
@@ -916,14 +1103,14 @@ app.get("/api/admin/surveys", async (_req, res) => {
   } catch { res.status(500).json({ error: "Listeleme hatası!" }); }
 });
 
-app.post("/api/surveys/:surveyId/status", async (req, res) => {
+app.post("/api/surveys/:surveyId/status", requireAdmin, async (req, res) => {
   const { status } = req.body;
   if (!["approved", "rejected"].includes(status)) return res.status(400).json({ error: "Geçersiz durum!" });
   try { await run(`UPDATE surveys SET status=$1 WHERE id=$2`, [status, req.params.surveyId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Durum güncellenemedi." }); }
 });
 
-app.post("/api/questions/:questionId/delete", async (req, res) => {
+app.post("/api/questions/:questionId/delete", requireAdmin, async (req, res) => {
   try { await run(`DELETE FROM questions WHERE id=$1`, [req.params.questionId]); res.json({ success: true }); }
   catch { res.status(500).json({ error: "Soru silinemedi." }); }
 });
@@ -2288,7 +2475,7 @@ app.get("/api/user/:userId/score", async (req, res) => {
   } catch { res.status(500).json({ error: "Skor hatası!" }); }
 });
 
-app.get("/api/surveys/:surveyId/answers-report", async (req, res) => {
+app.get("/api/surveys/:surveyId/answers-report", requireAdmin, async (req, res) => {
   try {
     const surveyId = req.params.surveyId;
     const questions = await all(`SELECT id, question FROM questions WHERE survey_id=$1 ORDER BY id ASC`, [surveyId]);
@@ -3494,13 +3681,9 @@ app.post("/api/books/spend", async (req, res) => {
   }
 });
 
-app.post("/api/daily/award-books", async (req, res) => {
+app.post("/api/daily/award-books", requireAdmin, async (req, res) => {
   try {
-    // Basit secret kontrolü (manuel tetiklemeyi koru)
-    if (req.body?.secret !== process.env.ADMIN_SECRET) {
-      return res.status(403).json({ error: "Yetkisiz" });
-    }
-
+      
     const targetDay = req.body?.day || await getYesterdayKey();
     if (!targetDay) return res.status(400).json({ error: "day belirlenemedi" });
 
@@ -3632,7 +3815,7 @@ app.get("/api/user/:userId/speed-tier", async (req, res) => {
 });
 
 /* ---------- ADMIN STATS & LEADERBOARDS ---------- */
-app.get("/api/admin/statistics", async (_req, res) => {
+app.get("/api/admin/statistics", requireAdmin, async (_req, res) => {
   try {
     const a = await get(`SELECT COUNT(*)::int AS count FROM users`);
     const b = await get(`SELECT COUNT(DISTINCT user_id)::int AS count FROM answers`);
@@ -3839,8 +4022,34 @@ async function awardSchedulerTick() {
   }
 }
 
+// Global error handler (tüm route'lardan sonra)
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Sunucu hatası." });
+});
+
+process.on("unhandledRejection", (r) => console.error("UNHANDLED REJECTION:", r));
+process.on("uncaughtException", (e) => { console.error("UNCAUGHT EXCEPTION:", e); });
+
+
 /* ---------- START ---------- */
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend http://0.0.0.0:${PORT} üzerinde çalışıyor`);
 });
+
+function gracefulShutdown(sig) {
+  console.log(`\n${sig} alındı — kapanıyor...`);
+  try {
+    for (const set of sseClients.values()) {
+      for (const r of set) { try { r.end(); } catch {} }
+    }
+    sseClients.clear();
+  } catch {}
+  server.close(async () => {
+    try { await pool.end(); } catch {}
+    process.exit(0);
+  });
+}
+
+["SIGINT", "SIGTERM"].forEach(sig => process.on(sig, () => gracefulShutdown(sig)));

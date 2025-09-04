@@ -11,11 +11,16 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "bcryptjs": "^3.0.2",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
-    "pg": "^8.16.3"
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.3",
+    "pino": "^9.9.1",
+    "pino-http": "^10.5.0"
   },
   "description": ""
 }
