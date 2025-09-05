@@ -397,6 +397,8 @@ const DUELLO_IDLE_ABORT_SEC = Math.max(
 const DUELLO_PER_Q_SEC  = Math.max(5, parseInt(process.env.DUELLO_PER_Q_SEC || "16", 10));
 const DUELLO_REVEAL_SEC = Math.max(1, parseInt(process.env.DUELLO_REVEAL_SEC || "3", 10));
 const SSE_RETRY_MS = Math.max(1000, parseInt(process.env.SSE_RETRY_MS || "3000", 10));
+// Günlük ödülü aynı güne iki kez yazmamak için
+let lastAwardedFor = null;
 
 
 
@@ -1011,16 +1013,73 @@ setInterval(async () => {
 // Günlük ödül/temizlik scheduler'ı (şimdilik güvenli no-op + hafif temizlik)
 async function awardSchedulerTick() {
   try {
-    // ileride otomatik “dünkü ilk 3’e kitap” mantığını buraya taşıyabiliriz.
-    // şimdilik sadece log + olası temizlikleri tetikleyelim:
-    logger.debug("awardSchedulerTick tick");
+    // küçük temizlikler (opsiyonel)
     try { await duelloRefreshFinished(); } catch (_) {}
     try { await expireOldInvites(); } catch (_) {}
+
+    const yKey = await getYesterdayKey();
+    if (!yKey) return;
+
+    // Aynı günü ikinci kez ödüllendirme
+    if (lastAwardedFor === yKey) return;
+
+    // Bu gün için daha önce ödül yazıldıysa çık
+    const already = await get(`SELECT 1 FROM book_awards WHERE day_key=$1 LIMIT 1`, [yKey]);
+    if (already) { lastAwardedFor = yKey; return; }
+
+    // Dünkü günlük yarışma puanlarını topla (eşitlikte daha hızlı bitiren öne)
+    const winners = await all(
+      `
+      SELECT
+        u.id,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ),0)::int AS total_points,
+        COALESCE(SUM(GREATEST(a.max_time_seconds,0) - GREATEST(a.time_left_seconds,0)),0)::int AS time_spent
+      FROM users u
+      INNER JOIN answers a ON a.user_id = u.id
+      INNER JOIN questions q ON q.id = a.question_id
+      WHERE a.is_daily = true
+        AND a.daily_key = $1
+      GROUP BY u.id
+      HAVING COUNT(a.*) > 0
+      ORDER BY total_points DESC, time_spent ASC, u.id ASC
+      LIMIT 3
+      `,
+      [yKey]
+    );
+
+    const prizes = [5, 3, 1];
+    for (let i = 0; i < winners.length; i++) {
+      const u = winners[i];
+      const amount = prizes[i] || 0;
+      if (amount <= 0) continue;
+
+      // aynı kullanıcıya aynı gün bir daha yazmamak için ON CONFLICT
+      const ins = await get(
+        `INSERT INTO book_awards (user_id, day_key, rank, amount)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (user_id, day_key) DO NOTHING
+         RETURNING 1 AS ok`,
+        [u.id, yKey, i + 1, amount]
+      );
+
+      if (ins?.ok) {
+        await run(`UPDATE users SET books = COALESCE(books,0) + $1 WHERE id=$2`, [amount, u.id]);
+        console.log("Ödül verildi:", yKey, "user", u.id, "rank", i + 1, "amount", amount);
+      }
+    }
+
+    lastAwardedFor = yKey;
   } catch (e) {
-    console.error("awardSchedulerTick error:", e?.message || e);
+    console.error("awardSchedulerTick hata:", e.message);
   }
 }
-
 
 
 // --- DUELLO: idle-timeout yardımcı fonksiyon (şimdilik sadece tanımlı) ---
@@ -4242,7 +4301,36 @@ app.get("/api/admin/statistics", requireAdmin, async (_req, res) => {
   } catch { res.status(500).json({ error: "İstatistik hatası!" }); }
 });
 
-/* ---------- LEADERBOARDS & STATS ---------- */
+/* ---------- ADMIN STATS & LEADERBOARDS (RESTORE) ---------- */
+
+// Admin özet istatistikleri
+app.get("/api/admin/statistics", requireAdmin, async (_req, res) => {
+  try {
+    const a = await get(`SELECT COUNT(*)::int AS count FROM users`);
+    const b = await get(`SELECT COUNT(DISTINCT user_id)::int AS count FROM answers`);
+    const c = await get(`SELECT COUNT(*)::int AS count FROM surveys WHERE status='approved'`);
+    const d = await get(`SELECT COUNT(*)::int AS count FROM questions`);
+    const e = await get(`SELECT COUNT(*)::int AS count FROM answers`);
+    const f = await get(`SELECT COUNT(*)::int AS count FROM answers WHERE is_correct=1`);
+    const g = await get(`SELECT COUNT(*)::int AS count FROM answers WHERE is_correct=0 AND answer!='bilmem'`);
+    const h = await get(`SELECT COUNT(*)::int AS count FROM answers WHERE answer='bilmem'`);
+    res.json({
+      success: true,
+      total_users: a?.count || 0,
+      total_active_users: b?.count || 0,
+      total_approved_surveys: c?.count || 0,
+      total_questions: d?.count || 0,
+      total_answers: e?.count || 0,
+      total_correct_answers: f?.count || 0,
+      total_wrong_answers: g?.count || 0,
+      total_bilmem: h?.count || 0,
+    });
+  } catch {
+    res.status(500).json({ error: "İstatistik hatası!" });
+  }
+});
+
+// Genel leaderboard (period destekli)
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const period = String(req.query.period || "all");
@@ -4284,6 +4372,90 @@ app.get("/api/leaderboard", async (req, res) => {
     res.status(500).json({ error: "Leaderboard alınamadı" });
   }
 });
+
+// Kullanıcının sırası (period destekli) — “Bugün ... sıradasın” bunu kullanıyor
+app.get("/api/user/:userId/rank", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const period = String(req.query.period || "all");
+    const periodClause = periodSql(period, "a");
+
+    const rows = await all(
+      `
+      SELECT u.id,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ), 0)::int AS total_points
+      FROM users u
+      LEFT JOIN answers a ON a.user_id = u.id
+      LEFT JOIN questions q ON a.question_id = q.id
+      WHERE 1=1
+        ${periodClause}
+      GROUP BY u.id
+      ORDER BY total_points DESC, u.id ASC
+      `
+    );
+
+    const idx = rows.findIndex(r => String(r.id) === String(userId));
+    const rank = idx === -1 ? 0 : (idx + 1);
+    const total_users = rows.length;
+    const user_points = rank > 0 ? rows[rank - 1].total_points : 0;
+
+    res.json({ success: true, rank, total_users, user_points });
+  } catch {
+    res.status(500).json({ error: "Sıralama alınamadı" });
+  }
+});
+
+// Anket/kategori bazlı leaderboard (period destekli)
+app.get("/api/surveys/:surveyId/leaderboard", async (req, res) => {
+  try {
+    const surveyId = req.params.surveyId;
+    const period = String(req.query.period || "all");
+    const periodClause = periodSql(period, "a");
+
+    const rows = await all(
+      `
+      SELECT u.id, u.ad, u.soyad,
+        COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ), 0)::int AS total_points
+      FROM users u
+      INNER JOIN answers a ON a.user_id = u.id
+      INNER JOIN questions q ON a.question_id = q.id
+      WHERE 1=1
+        ${periodClause}
+        AND a.question_id IN (SELECT id FROM questions WHERE survey_id = $1)
+      GROUP BY u.id
+      HAVING COALESCE(SUM(
+          CASE
+            WHEN a.answer = 'bilmem' THEN 0
+            WHEN a.is_correct = 1 THEN q.point + COALESCE(a.bonus_points,0)
+            WHEN a.is_correct = 0 THEN -q.point
+            ELSE 0
+          END
+        ), 0) != 0
+      ORDER BY total_points DESC, u.id ASC
+      `,
+      [surveyId]
+    );
+
+    res.json({ success: true, leaderboard: rows });
+  } catch {
+    res.status(500).json({ error: "Anket leaderboard alınamadı!" });
+  }
+});
+
 
 /* ---------- GLOBAL ERROR HANDLER & SHUTDOWN ---------- */
 app.use((err, _req, res, _next) => {
