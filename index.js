@@ -17,6 +17,8 @@ const pinoHttp = require("pino-http");
 
 const app = express();
 app.disable("x-powered-by");
+app.set("etag", false);
+
 
 // reverse proxy arkasında gerçek IP için
 app.set("trust proxy", 1);
@@ -34,15 +36,47 @@ app.use(cors({
   },
   credentials: true,
   allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
-  exposedHeaders: ["x-request-id"]
+  exposedHeaders: ["x-request-id", "etag"]
 }));
 
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+
+// --- Pino logger (güvenli redact) ---
+const redactPaths = (() => {
+  const env = process.env.PINO_REDACT;
+  if (!env) {
+    return [
+      'req.headers.authorization',
+      'req.headers.cookie',
+      'res.headers["set-cookie"]',
+      'req.body.password',
+      'req.body.secret',
+      'req.body.admin_secret'
+    ];
+  }
+  try {
+    const parsed = JSON.parse(env);
+    return Array.isArray(parsed)
+      ? parsed
+      : String(env).split(',').map(s => s.trim()).filter(Boolean);
+  } catch {
+    return String(env).split(',').map(s => s.trim()).filter(Boolean);
+  }
+})();
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  // pino v8+: redact object -> paths zorunlu
+  redact: { paths: redactPaths, censor: '[REDACTED]' },
+});
+
+
+
 app.use(pinoHttp({
-  logger: pino(),
+  logger, // üstte tanımladığımız pino instance
   genReqId: (req, res) => req.id || req.headers['x-request-id'] || crypto.randomUUID(),
-  redact: { /* ... mevcut ayarlar ... */ },
+  // DİKKAT: redact BURADA YOK. (redact logger içinde!)
   autoLogging: {
     ignore: (req) => {
       const u = req.url || '';
@@ -62,6 +96,7 @@ app.use(pinoHttp({
     return 'info';
   }
 }));
+
 
 
 
