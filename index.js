@@ -1,4 +1,7 @@
-require("dotenv").config();
+// .env sadece local gelişimde yüklensin
+if (process.env.NODE_ENV !== "production") {
+  try { require("dotenv").config(); } catch {}
+}
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
