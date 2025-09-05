@@ -42,21 +42,25 @@ app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 app.use(pinoHttp({
   logger: pino(),
   genReqId: (req, res) => req.id || req.headers['x-request-id'] || crypto.randomUUID(),
-    redact: {
-    paths: [
-      'req.headers.authorization',
-      'req.headers.cookie',
-      'req.headers["x-admin-secret"]',
-      'req.body.password',
-      'req.body.secret',
-      'req.body.admin_secret',
-      'req.body.*.password',     // nested objelerdeki `password` için
-      'req.query.admin_secret',  // <— BURAYA VİRGÜL EKLENDİ
-      'req.query.secret'
-    ],
-    censor: '[REDACTED]'
+  redact: { /* ... mevcut ayarlar ... */ },
+  autoLogging: {
+    ignore: (req) => {
+      const u = req.url || '';
+      return (
+        u.startsWith('/api/duello/inbox/') ||
+        u.startsWith('/api/duello/outbox/') ||
+        u.startsWith('/api/duello/active/') ||
+        (u.startsWith('/api/duello/match/') && u.endsWith('/status'))
+      );
+    }
+  },
+  customLogLevel: (req, res, err) => {
+    if (err) return 'error';
+    if (res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    if (res.statusCode === 304) return 'silent';
+    return 'info';
   }
-
 }));
 
 
@@ -351,6 +355,8 @@ const SSE_RETRY_MS = Math.max(1000, parseInt(process.env.SSE_RETRY_MS || "3000",
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.send("healthy"));
 
+// Render bazı projelerde /health bekliyor
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 // === DUELLO SSE stream ===
 // Tarayıcı: new EventSource(`${API}/api/duello/events/${userId}`)
@@ -2006,11 +2012,50 @@ sseEmit(Number(inv.from_user_id), "invite:cancelled", { invite_id: Number(invite
 });
 
 
-/** Gelen kutusu: pending ve süresi geçmemiş davetler */
+async function inboxSig(uid) {
+  return await get(`
+    SELECT
+      COUNT(*)::int AS c,
+      COALESCE(MAX(GREATEST(created_at, accepted_at, rejected_at, cancelled_at, expire_at)),
+               TIMESTAMP 'epoch') AS last
+    FROM duello_invites
+    WHERE to_user_id=$1
+      AND status='pending'
+      AND expire_at > timezone('Europe/Istanbul', now())
+  `, [uid]);
+}
+
+async function outboxSig(uid) {
+  return await get(`
+    SELECT
+      COUNT(*)::int AS c,
+      COALESCE(MAX(GREATEST(created_at, accepted_at, rejected_at, cancelled_at, expire_at)),
+               TIMESTAMP 'epoch') AS last
+    FROM duello_invites
+    WHERE from_user_id=$1
+      AND status='pending'
+      AND expire_at > timezone('Europe/Istanbul', now())
+  `, [uid]);
+}
+
+
+// === DUELLO: Inbox (ETag ile hafif polling) ===
 app.get("/api/duello/inbox/:userId", async (req, res) => {
   try {
     const uid = Number(req.params.userId);
-    await expireOldInvites();
+    if (!uid) return res.status(400).json({ error: "userId zorunlu" });
+
+    // Ucuz imza + ETag
+    const sig = await inboxSig(uid);
+    const lastTs = sig?.last ? new Date(sig.last).getTime() : 0;
+    const etag = `W/"in-${sig?.c || 0}-${lastTs}"`;
+    res.set("ETag", etag);
+
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+
+    // Değişim varsa ancak o zaman ağır sorgu
     const rows = await all(
       `SELECT i.id, i.from_user_id, i.to_user_id, i.mode, i.created_at, i.expire_at, i.status,
               u.ad AS from_ad, u.soyad AS from_soyad, u.user_code AS from_user_code
@@ -2022,19 +2067,30 @@ app.get("/api/duello/inbox/:userId", async (req, res) => {
         ORDER BY i.created_at DESC`,
       [uid]
     );
-    // FE uyumluluğu: hem "invites" hem "inbox" döndür
-res.json({ success: true, invites: rows, inbox: rows });
 
+    res.json({ success: true, invites: rows, inbox: rows });
   } catch (e) {
     res.status(500).json({ error: "Gelen davetler alınamadı: " + e.message });
   }
 });
 
-/** Giden kutusu: pending ve süresi geçmemiş davetler */
+// === DUELLO: Outbox (ETag ile hafif polling) ===
 app.get("/api/duello/outbox/:userId", async (req, res) => {
   try {
     const uid = Number(req.params.userId);
-    await expireOldInvites();
+    if (!uid) return res.status(400).json({ error: "userId zorunlu" });
+
+    // Ucuz imza + ETag
+    const sig = await outboxSig(uid);
+    const lastTs = sig?.last ? new Date(sig.last).getTime() : 0;
+    const etag = `W/"out-${sig?.c || 0}-${lastTs}"`;
+    res.set("ETag", etag);
+
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+
+    // Değişim varsa ancak o zaman ağır sorgu
     const rows = await all(
       `SELECT i.id, i.from_user_id, i.to_user_id, i.mode, i.created_at, i.expire_at, i.status,
               u.ad AS to_ad, u.soyad AS to_soyad, u.user_code AS to_user_code
@@ -2046,13 +2102,13 @@ app.get("/api/duello/outbox/:userId", async (req, res) => {
         ORDER BY i.created_at DESC`,
       [uid]
     );
-    // FE uyumluluğu: hem "invites" hem "outbox" döndür
-res.json({ success: true, invites: rows, outbox: rows });
 
+    res.json({ success: true, invites: rows, outbox: rows });
   } catch (e) {
     res.status(500).json({ error: "Giden davetler alınamadı: " + e.message });
   }
 });
+
 
 // === DUELLO: Rastgele hazır rakip bul ve maçı başlat ===
 // FE: POST /api/duello/random-ready  body: { user_id, mode: 'info'|'speed' }
@@ -2069,16 +2125,7 @@ app.get("/api/duello/active/:userId", async (req, res) => {
   try {
     const uid = Number(req.params.userId);
     if (!uid) return res.status(400).json({ error: "userId zorunlu" });
-    // Bitmiş ama 'active' kalan maçları kapat
-    await run(`
-      UPDATE duello_matches
-         SET state='finished',
-             finished_at = timezone('Europe/Istanbul', now())
-       WHERE state='active'
-         AND current_index >= total_questions
-    `);
-    await duelloRefreshFinished();
-
+    
     const row = await get(
       `SELECT id
          FROM duello_matches
