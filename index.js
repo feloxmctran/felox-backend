@@ -66,21 +66,28 @@ const redactPaths = (() => {
 })();
 
 const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  // pino v8+: redact object -> paths zorunlu
+  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'error' : 'info'),
   redact: { paths: redactPaths, censor: '[REDACTED]' },
 });
 
 
-
 app.use(pinoHttp({
-  logger, // üstte tanımladığımız pino instance
+  logger,
   genReqId: (req, res) => req.id || req.headers['x-request-id'] || crypto.randomUUID(),
-  // DİKKAT: redact BURADA YOK. (redact logger içinde!)
   autoLogging: {
     ignore: (req) => {
       const u = req.url || '';
+      const a = String(req.headers.accept || '');
       return (
+        // gürültülü/tekrarlı uçlar
+        u === '/' ||
+        u.startsWith('/health') || u.startsWith('/healthz') ||
+        u.startsWith('/metrics') ||
+        u.startsWith('/static') || u.startsWith('/assets') ||
+        u.startsWith('/favicon') ||
+        // SSE akışı
+        a.includes('text/event-stream') || u.startsWith('/api/duello/events') ||
+        // mevcut ignore’lar
         u.startsWith('/api/duello/inbox/') ||
         u.startsWith('/api/duello/outbox/') ||
         u.startsWith('/api/duello/active/') ||
@@ -88,13 +95,19 @@ app.use(pinoHttp({
       );
     }
   },
-  customLogLevel: (req, res, err) => {
+  // 5xx ve thrown error -> error, 4xx -> warn, 304/success -> silent
+  customLogLevel: (_req, res, err) => {
     if (err) return 'error';
     if (res.statusCode >= 500) return 'error';
     if (res.statusCode >= 400) return 'warn';
-    if (res.statusCode === 304) return 'silent';
-    return 'info';
-  }
+    return 'silent'; // 2xx/3xx hiç yazma
+  },
+  // yalın serializer: log boyutu küçük
+  serializers: {
+    req: (req) => ({ method: req.method, url: req.url }),
+    res: (res) => ({ statusCode: res.statusCode }),
+    err: (err) => ({ type: err.type, message: err.message, stack: err.stack }),
+  },
 }));
 
 
@@ -159,6 +172,7 @@ function requireAdmin(req, res, next) {
   if (isAdminAuthenticated(req)) return next();
   return res.status(403).json({ error: "Yetkisiz" });
 }
+
 
 
 
@@ -999,7 +1013,7 @@ async function awardSchedulerTick() {
   try {
     // ileride otomatik “dünkü ilk 3’e kitap” mantığını buraya taşıyabiliriz.
     // şimdilik sadece log + olası temizlikleri tetikleyelim:
-    console.log("awardSchedulerTick tick");
+    logger.debug("awardSchedulerTick tick");
     try { await duelloRefreshFinished(); } catch (_) {}
     try { await expireOldInvites(); } catch (_) {}
   } catch (e) {
@@ -4302,5 +4316,3 @@ function gracefulShutdown(sig) {
     process.exit(0);
   });
 }
-
-["SIGINT", "SIGTERM"].forEach(sig => process.on(sig, () => gracefulShutdown(sig)));
