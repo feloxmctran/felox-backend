@@ -475,6 +475,44 @@ res.on("error", cleanup);
 
 
 /* ---------- HELPERS ---------- */
+
+
+// --- Streak -> Ağaç aşaması (stage) ---
+// Eşikler: 0,3,7,14,30,60,100,365  (8 seviye)
+const TREE_THRESHOLDS = [0, 3, 7, 14, 30, 60, 100, 365];
+
+// Bu anahtarları manifest.json’daki isimlerinle AYNI yap.
+// Örn. manifest["tree_seed"] gibi erişeceksin FE'de.
+const TREE_KEYS = [
+  "A1",       // 0+
+  "A2",     // 3+
+  "A3",    // 7+
+  "A4",      // 14+
+  "A5",     // 30+
+  "A6",        // 60+
+  "A7",    // 100+
+  "A8"   // 365+
+];
+
+/** Verilen streak için ağaç aşaması ve meta döner. */
+function streakTreeStage(streak) {
+  const s = Math.max(0, parseInt(streak || 0, 10));
+  let stage = 0;
+  for (let i = 0; i < TREE_THRESHOLDS.length; i++) {
+    if (s >= TREE_THRESHOLDS[i]) stage = i;
+  }
+  const key = TREE_KEYS[stage] || TREE_KEYS[0];
+  const min = TREE_THRESHOLDS[stage];
+  const next = TREE_THRESHOLDS[stage + 1] ?? null;
+  const to_next = next == null ? null : Math.max(0, next - s);
+  const prevMin = min;
+  const denom = next == null ? 1 : Math.max(1, next - prevMin);
+  const progress = next == null ? 1 : Math.min(1, (s - prevMin) / denom);
+  return { stage, key, min, next_threshold: next, to_next, progress };
+}
+
+
+
 function periodSql(period, alias = "a") {
   const col = `${alias}.created_at`;
   const tzNow = `timezone('Europe/Istanbul', now())`;
@@ -3785,6 +3823,8 @@ app.get("/api/daily/status", async (req, res) => {
     const streak_current = st?.cur || 0;
     const todayBonusBase = (st?.last === dayKey) ? Math.max(0, streak_current - 1) : streak_current;
     const today_bonus_per_correct = streakBonus(todayBonusBase);
+    const tree = streakTreeStage(streak_current);
+
 
     if (finished) {
       return res.json({
@@ -3796,6 +3836,7 @@ app.get("/api/daily/status", async (req, res) => {
         question: null,
         streak_current,
         today_bonus_per_correct
+        tree
       });
     }
 
@@ -3817,6 +3858,7 @@ app.get("/api/daily/status", async (req, res) => {
       question: q,
       streak_current,
       today_bonus_per_correct
+      tree
     });
   } catch (e) {
     console.error(e);
