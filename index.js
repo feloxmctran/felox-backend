@@ -3835,7 +3835,7 @@ app.get("/api/daily/status", async (req, res) => {
         size: ids.length,
         question: null,
         streak_current,
-        today_bonus_per_correct
+        today_bonus_per_correct,
         tree
       });
     }
@@ -3857,7 +3857,7 @@ app.get("/api/daily/status", async (req, res) => {
       size: ids.length,
       question: q,
       streak_current,
-      today_bonus_per_correct
+      today_bonus_per_correct,
       tree
     });
   } catch (e) {
